@@ -393,6 +393,212 @@ def deviceTraitDelete(deviceTrait) {
     }
 }
 
+def handleAction() {
+    LOGGER.debug(request.JSON)
+    def requestType = request.JSON.inputs[0].intent
+    if (requestType == "action.devices.SYNC") {
+        return handleSyncRequest(request)
+    } else if (requestType == "action.devices.QUERY") {
+        return handleQueryRequest(request)
+    } else if (requestType == "action.devices.EXECUTE") {
+        return handleExecuteRequest(request)
+    } else if (requestType == "action.devices.DISCONNECT") {
+        return [:]
+    }
+}
+
+private handleExecuteRequest(request) {
+    def resp = [
+        requestId: request.JSON.requestId,
+        payload: [
+            commands: []
+        ]
+    ]
+    def knownDevices = allKnownDevices()
+    def commands = request.JSON.inputs[0].payload.commands
+    commands.each { command ->
+        def devices = command.devices.collect { device -> knownDevices."${device.id}" }
+        // Send appropriate commands to devices
+        devices.each { device ->
+            def result = [
+                ids: [device.device.id],
+                status: "SUCCESS",
+                states: [
+                    online: true
+                ]
+            ]
+            // Populate with current states
+            device.deviceType.traits.each { traitType, deviceTrait ->
+                result.states << "deviceStateForTrait_${traitType}"(deviceTrait, device.device)
+            }
+            // Execute command
+            command.execution.each { execution ->
+                def commandName = execution.command.split("\\.").last()
+                try {
+                    result.states << "executeCommand_${commandName}"(device, execution)
+                } catch (Exception ex) {
+                    result << [
+                        status: "ERROR"
+                    ]
+                    try {
+                        result << parseJson(ex.message)
+                    } catch (JsonException jex) {
+                        LOGGER.exception(
+                            "Error executing command ${commandName} on device ${device.device.name}",
+                            ex
+                        )
+                        result << [
+                            errorCode: "hardError"
+                        ]
+                    }
+                }
+            }
+            resp.payload.commands << result
+        }
+    }
+    LOGGER.debug(resp)
+    return resp
+}
+
+private checkMfa(deviceType, commandType, command) {
+    commandType = commandType as String
+    LOGGER.debug("Checking MFA for ${commandType} command")
+    if (commandType in deviceType.confirmCommands && !command.challenge?.ack) {
+        throw new Exception(JsonOutput.toJson([
+            errorCode: "challengeNeeded",
+            challengeNeeded: [
+                type: "ackNeeded"
+            ]
+        ]))
+    }
+    if (commandType in deviceType.secureCommands) {
+        def globalPinCodes = deviceTypeFromSettings('GlobalPinCodes')
+        if (!command.challenge?.pin) {
+            throw new Exception(JsonOutput.toJson([
+                errorCode: "challengeNeeded",
+                challengeNeeded: [
+                    type: "pinNeeded"
+                ]
+            ]))
+        } else if (!(command.challenge.pin in deviceType.pinCodes*.value)
+                   && !(command.challenge.pin in globalPinCodes.pinCodes*.value)) {
+            throw new Exception(JsonOutput.toJson([
+                errorCode: "challengeNeeded",
+                challengeNeeded: [
+                    type: "challengeFailedPinNeeded"
+                ]
+            ]))
+        }
+    }
+}
+// Scene
+@SuppressWarnings('UnusedPrivateMethod')
+def deviceTraitPreferences_Scene(deviceTrait) {
+    section("Scene Preferences") {
+        input(
+            name: "${deviceTrait.name}.activateCommand",
+            title: "Activate Command",
+            type: "text",
+            defaultValue: "on",
+            required: true
+        )
+        input(
+            name: "${deviceTrait.name}.sceneReversible",
+            title: "Can this scene be deactivated?",
+            type: "bool",
+            defaultValue: false,
+            required: true,
+            submitOnChange: true
+        )
+        if (settings."${deviceTrait.name}.sceneReversible") {
+            input(
+                name: "${deviceTrait.name}.deactivateCommand",
+                title: "Deactivate Command",
+                type: "text",
+                defaultValue: "off",
+                required: true
+            )
+        }
+    }
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private attributesForTrait_Scene(deviceTrait) {
+    return [
+        sceneReversible: deviceTrait.sceneReversible
+    ]
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private traitFromSettings_Scene(traitName) {
+    def sceneTrait = [
+        activateCommand: settings."${traitName}.activateCommand",
+        sceneReversible: settings."${traitName}.sceneReversible",
+        commands:        ["Activate Scene"]
+    ]
+    if (sceneTrait.sceneReversible) {
+        sceneTrait.deactivateCommand = settings."${traitName}.deactivateCommand"
+        sceneTrait.commands << "Deactivate Scene"
+    }
+    return sceneTrait
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private deleteDeviceTrait_Scene(deviceTrait) {
+    app.removeSetting("${deviceTrait.name}.activateCommand")
+    app.removeSetting("${deviceTrait.name}.deactivateCommand")
+    app.removeSetting("${deviceTrait.name}.sceneReversible")
+}
+
+@SuppressWarnings(['UnusedPrivateMethod', 'UnusedPrivateMethodParameter'])
+private deviceStateForTrait_Scene(deviceTrait, device) {
+    return [:]
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private controlScene(options) {
+    def allDevices = allKnownDevices()
+    def device = allDevices[options.deviceId].device
+    device."${options.command}"()
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private executeCommand_ActivateScene(deviceInfo, command) {
+    def sceneTrait = deviceInfo.deviceType.traits.Scene
+    if (sceneTrait.name == "hubitat_mode") {
+        location.mode = deviceInfo.device.name
+    } else {
+        if (command.params.deactivate) {
+            checkMfa(deviceInfo.deviceType, "Deactivate Scene", command)
+            runIn(
+                0,
+                "controlScene",
+                [
+                    data: [
+                        "deviceId": deviceInfo.device.id,
+                        "command": sceneTrait.deactivateCommand
+                    ]
+                ]
+            )
+        } else {
+            checkMfa(deviceInfo.deviceType, "Activate Scene", command)
+            runIn(
+                0,
+                "controlScene",
+                [
+                    data: [
+                        "deviceId": deviceInfo.device.id,
+                        "command": sceneTrait.activateCommand
+                    ]
+                ]
+            )
+        }
+    }
+    return [:]
+}
+
+
+// Brightness
 @SuppressWarnings('UnusedPrivateMethod')
 private deviceTraitPreferences_Brightness(deviceTrait) {
     section ("Brightness Settings") {
@@ -413,6 +619,46 @@ private deviceTraitPreferences_Brightness(deviceTrait) {
     }
 }
 
+@SuppressWarnings(['UnusedPrivateMethod', 'UnusedPrivateMethodParameter'])
+private attributesForTrait_Brightness(deviceTrait) {
+    return [:]
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private traitFromSettings_Brightness(traitName) {
+    return [
+        brightnessAttribute:  settings."${traitName}.brightnessAttribute",
+        setBrightnessCommand: settings."${traitName}.setBrightnessCommand",
+        commands:             ["Set Brightness"]
+    ]
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private deleteDeviceTrait_Brightness(deviceTrait) {
+    app.removeSetting("${deviceTrait.name}.brightnessAttribute")
+    app.removeSetting("${deviceTrait.name}.setBrightnessCommand")
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private deviceStateForTrait_Brightness(deviceTrait, device) {
+    def currentBrightness = device.currentValue(deviceTrait.brightnessAttribute)
+    // Map 99 to 100, ultimatly black holes 99, but meh...
+    return [
+        brightness: currentBrightness == 99 ? 100 : currentBrightness
+    ]
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private executeCommand_BrightnessAbsolute(deviceInfo, command) {
+    checkMfa(deviceInfo.deviceType, "Set Brightness", command)
+	def brightnessTrait = deviceInfo.deviceType.traits.Brightness
+    deviceInfo.device."${brightnessTrait.setBrightnessCommand}"(command.params.brightness)
+    return [
+        brightness: command.params.brightness
+    ]
+}
+
+// CameraStream
 @SuppressWarnings('UnusedPrivateMethod')
 def deviceTraitPreferences_CameraStream(deviceTrait) {
     section("Stream Camera") {
@@ -426,6 +672,45 @@ def deviceTraitPreferences_CameraStream(deviceTrait) {
     }
 }
 
+@SuppressWarnings(['UnusedPrivateMethod', 'UnusedPrivateMethodParameter'])
+private attributesForTrait_CameraStream(deviceTrait) {
+    return [
+        cameraStreamSupportedProtocols: ["progressive_mp4", "hls", "dash", "smooth_stream"],
+        cameraStreamNeedAuthToken:      false,
+        cameraStreamNeedDrmEncryption:  false
+    ]
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private traitFromSettings_CameraStream(traitName) {
+    return [
+        cameraStreamAttribute: settings."${traitName}.cameraStreamAttribute",
+        commands:              []
+    ]
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private deleteDeviceTrait_CameraStream(deviceTrait) {
+    app.removeSetting("${deviceTrait.name}.cameraStreamAttribute")
+}
+
+@SuppressWarnings(['UnusedPrivateMethod', 'UnusedPrivateMethodParameter'])
+private deviceStateForTrait_CameraStream(deviceTrait, device) {
+    return [
+        cameraStreamAccessUrl: device.currentValue(deviceTrait.cameraStreamAttribute),
+        cameraStreamReceiverAppId: null,
+        cameraStreamAuthToken: null
+    ]
+}
+
+@SuppressWarnings(['UnusedPrivateMethod', 'UnusedPrivateMethodParameter'])
+private executeCommand_GetCameraStream(deviceInfo, command) {
+    // No need to overwrite any of the fields from deviceStateForTrait_CameraStream 
+    return [:]
+}
+
+
+// ColorSetting
 @SuppressWarnings(['MethodSize', 'UnusedPrivateMethod'])
 private deviceTraitPreferences_ColorSetting(deviceTrait) {
     section ("Color Setting Preferences") {
@@ -530,122 +815,166 @@ private deviceTraitPreferences_ColorSetting(deviceTrait) {
 }
 
 @SuppressWarnings('UnusedPrivateMethod')
-private deviceTraitPreferences_FanSpeed(deviceTrait) {
-    hubitatFanSpeeds = [
-        "low":         "Low",
-        "medium-low":  "Medium-Low",
-        "medium":      "Medium",
-        "medium-high": "Medium-High",
-        "high":        "High",
-        "auto":        "Auto",
-    ]
-    section("Fan Speed Settings") {
-        input(
-            name: "${deviceTrait.name}.currentSpeedAttribute",
-            title: "Current Speed Attribute",
-            type: "text",
-            defaultValue: "speed",
-            required: true
-        )
-        input(
-            name: "${deviceTrait.name}.setFanSpeedCommand",
-            title: "Set Speed Command",
-            type: "text",
-            defaultValue: "setSpeed",
-            required: true
-        )
-        input(
-            name: "${deviceTrait.name}.fanSpeeds",
-            title: "Supported Fan Speeds",
-            type: "enum",
-            options: hubitatFanSpeeds,
-            multiple: true,
-            required: true,
-            submitOnChange: true
-        )
-        deviceTrait.fanSpeeds.each { fanSpeed ->
-            input(
-                name: "${deviceTrait.name}.speed.${fanSpeed.key}.googleNames",
-                title: "Google Home Level Names for ${hubitatFanSpeeds[fanSpeed.key]}",
-                description: "A comma-separated list of names that the Google Assistant will " +
-                             "accept for this speed setting",
-                type: "text",
-                required: "true",
-                defaultValue: hubitatFanSpeeds[fanSpeed.key]
-            )
-        }
+private attributesForTrait_ColorSetting(deviceTrait) {
+    def colorAttrs = [:]
+    if (deviceTrait.fullSpectrum) {
+        colorAttrs << [
+            colorModel: "hsv"
+        ]
     }
-
-    section("Reverse Settings") {
-        input(
-            name: "${deviceTrait.name}.reversible",
-            title: "Reversible",
-            type: "bool",
-            defaultValue: false,
-            submitOnChange: true
-        )
-
-        if (settings."${deviceTrait.name}.reversible") {
-            input(
-                name: "${deviceTrait.name}.reverseCommand",
-                title: "Reverse Command",
-                type: "text",
-                required: true
-            )
-        }
+    if (deviceTrait.colorTemperature) {
+        colorAttrs << [
+            colorTemperatureRange: [
+                temperatureMinK: deviceTrait.colorTemperatureMin,
+                temperatureMaxK: deviceTrait.colorTemperatureMax
+            ]
+        ]
     }
+    return colorAttrs
 }
 
 @SuppressWarnings('UnusedPrivateMethod')
-private deviceTraitPreferences_HumiditySetting(deviceTrait) {
-    section("Humidity Setting Preferences") {
-        input(
-            name: "${deviceTrait.name}.humidityAttribute",
-            title: "Humidity Attribute",
-            type: "text",
-            defaultValue: "humidity",
-            required: true
-        )
-        input(
-            name: "${deviceTrait.name}.queryOnly",
-            title: "Query Only Humidity",
-            type: "bool",
-            defaultValue: false,
-            require: true,
-            submitOnChange: true
-        )
-        if (!deviceTrait.queryOnly) {
-            input(
-                name: "${deviceTrait.name}.humiditySetpointAttribute",
-                title: "Humidity Setpoint Attribute",
-                type: "text",
-                required: true
-            )
-            input(
-                name: "${deviceTrait.name}.setHumidityCommand",
-                title: "Set Humidity Command",
-                type: "text",
-                required: true
-            )
-            paragraph("If either a minimum or maximum humidity setpoint is configured then the other must be as well")
-            input(
-                name: "${deviceTrait.name}.humidityRange.min",
-                title: "Minimum Humidity Setpoint",
-                type: "number",
-                required: deviceTrait.humidityRange?.max != null,
-                submitOnChange: true
-            )
-            input(
-                name: "${deviceTrait.name}.humidityRange.max",
-                title: "Maximum Humidity Setpoint",
-                type: "number",
-                required: deviceTrait.humidityRange?.min != null,
-                submitOnChange: true
-            )
-        }
+private traitFromSettings_ColorSetting(traitName) {
+    def deviceTrait = [
+        fullSpectrum:     settings."${traitName}.fullSpectrum",
+        colorTemperature: settings."${traitName}.colorTemperature",
+        commands:         ["Set Color"]
+    ]
+
+    if (deviceTrait.fullSpectrum) {
+        deviceTrait << [
+            hueAttribute:        settings."${traitName}.hueAttribute",
+            saturationAttribute: settings."${traitName}.saturationAttribute",
+            levelAttribute:      settings."${traitName}.levelAttribute",
+            setColorCommand:     settings."${traitName}.setColorCommand"
+        ]
     }
+    if (deviceTrait.colorTemperature) {
+        deviceTrait << [
+            colorTemperatureMin:        settings."${traitName}.colorTemperature.min",
+            colorTemperatureMax:        settings."${traitName}.colorTemperature.max",
+            colorTemperatureAttribute:  settings."${traitName}.colorTemperatureAttribute",
+            setColorTemperatureCommand: settings."${traitName}.setColorTemperatureCommand"
+        ]
+    }
+    if (deviceTrait.fullSpectrum && deviceTrait.colorTemperature) {
+        deviceTrait << [
+            colorModeAttribute:    settings."${traitName}.colorModeAttribute",
+            fullSpectrumModeValue: settings."${traitName}.fullSpectrumModeValue",
+            temperatureModeValue:  settings."${traitName}.temperatureModeValue"
+        ]
+    }
+
+    return deviceTrait
 }
 
+@SuppressWarnings('UnusedPrivateMethod')
+private deleteDeviceTrait_ColorSetting(deviceTrait) {
+    app.removeSetting("${deviceTrait.name}.fullSpectrum")
+    app.removeSetting("${deviceTrait.name}.hueAttribute")
+    app.removeSetting("${deviceTrait.name}.saturationAttribute")
+    app.removeSetting("${deviceTrait.name}.levelAttribute")
+    app.removeSetting("${deviceTrait.name}.setColorCommand")
+    app.removeSetting("${deviceTrait.name}.colorTemperature")
+    app.removeSetting("${deviceTrait.name}.colorTemperature.min")
+    app.removeSetting("${deviceTrait.name}.colorTemperature.max")
+    app.removeSetting("${deviceTrait.name}.colorTemperatureAttribute")
+    app.removeSetting("${deviceTrait.name}.setColorTemperatureCommand")
+    app.removeSetting("${deviceTrait.name}.colorModeAttribute")
+    app.removeSetting("${deviceTrait.name}.fullSpectrumModeValue")
+    app.removeSetting("${deviceTrait.name}.temperatureModeValue")
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private deviceStateForTrait_ColorSetting(deviceTrait, device) {
+    def colorMode
+    if (deviceTrait.fullSpectrum && deviceTrait.colorTemperature) {
+        if (device.currentValue(deviceTrait.colorModeAttribute) == deviceTrait.fullSpectrumModeValue) {
+            colorMode = "spectrum"
+        } else {
+            colorMode = "temperature"
+        }
+    } else if (deviceTrait.fullSpectrum) {
+        colorMode = "spectrum"
+    } else {
+        colorMode = "temperature"
+    }
+
+    def deviceState = [
+        color: [:]
+    ]
+
+    if (colorMode == "spectrum") {
+        def hue = device.currentValue(deviceTrait.hueAttribute)
+        def saturation = device.currentValue(deviceTrait.saturationAttribute)
+        def value = device.currentValue(deviceTrait.levelAttribute)
+
+        // Hubitat reports hue in the range 0...100, but Google wants it in degrees (0...360)
+        hue = hue * 360 / 100
+        // Hubitat reports saturation and value in the range 0...100 but
+        // Google wants them as floats in the range 0...1
+        saturation = saturation / 100
+        value = value / 100
+
+        deviceState.color = [
+            spectrumHsv: [
+                hue: hue,
+                saturation: saturation,
+                value: value
+            ]
+        ]
+    } else {
+        deviceState.color = [
+            temperatureK: device.currentValue(deviceTrait.colorTemperatureAttribute)
+        ]
+    }
+
+    return deviceState
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private executeCommand_ColorAbsolute(deviceInfo, command) {
+    checkMfa(deviceInfo.deviceType, "Set Color", command)
+    def colorTrait = deviceInfo.deviceType.traits.ColorSetting
+
+    def checkAttrs = [:]
+    if (command.params.color.temperature) {
+        def temperature = command.params.color.temperature
+        deviceInfo.device."${colorTrait.setColorTemperatureCommand}"(temperature)
+        checkAttrs << [
+            color: [
+                temperatureK: temperature
+            ]
+        ]
+    } else if (command.params.color.spectrumHSV) {
+        def hsv = command.params.color.spectrumHSV
+        // Google sends hue in degrees (0...360), but hubitat wants it in the range 0...100
+        def hue = Math.round(hsv.hue * 100 / 360)
+        // Google sends saturation and value as floats in the range 0...1,
+        // but Hubitat wants them in the range 0...100
+        def saturation = Math.round(hsv.saturation * 100)
+        def value = Math.round(hsv.value * 100)
+
+        deviceInfo.device."${colorTrait.setColorCommand}"([
+            hue:        hue,
+            saturation: saturation,
+            level:      value
+        ])
+        checkAttrs << [
+            color: [
+                spectrumHsv: [
+                    hue:        hue,
+                    saturation: saturation,
+                    value:      value
+                ]
+            ]
+        ]
+    }
+    return checkAttrs
+}
+
+
+// LockUnlock
 @SuppressWarnings('UnusedPrivateMethod')
 private deviceTraitPreferences_LockUnlock(deviceTrait) {
     section("Lock/Unlock Settings") {
@@ -680,6 +1009,57 @@ private deviceTraitPreferences_LockUnlock(deviceTrait) {
     }
 }
 
+@SuppressWarnings(['UnusedPrivateMethod', 'UnusedPrivateMethodParameter'])
+private attributesForTrait_LockUnlock(deviceTrait) {
+    return [:]
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private traitFromSettings_LockUnlock(traitName) {
+    return [
+        lockedUnlockedAttribute: settings."${traitName}.lockedUnlockedAttribute",
+        lockedValue:             settings."${traitName}.lockedValue",
+        lockCommand:             settings."${traitName}.lockCommand",
+        unlockCommand:           settings."${traitName}.unlockCommand",
+        commands:                ["Lock", "Unlock"]
+    ]
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private deleteDeviceTrait_LockUnlock(deviceTrait) {
+    app.removeSetting("${deviceTrait.name}.lockedUnlockedAttribute")
+    app.removeSetting("${deviceTrait.name}.lockedValue")
+    app.removeSetting("${deviceTrait.name}.lockCommand")
+    app.removeSetting("${deviceTrait.name}.unlockCommand")
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private deviceStateForTrait_LockUnlock(deviceTrait, device) {
+    def isLocked = device.currentValue(deviceTrait.lockedUnlockedAttribute) == deviceTrait.lockedValue
+    return [
+        isLocked: isLocked,
+        isJammed: false
+    ]
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private executeCommand_LockUnlock(deviceInfo, command) {
+    def lockUnlockTrait = deviceInfo.deviceType.traits.LockUnlock
+    if (command.params.lock) {
+        checkMfa(deviceInfo.deviceType, "Lock", command)
+        deviceInfo.device."${lockUnlockTrait.lockCommand}"()
+    } else {
+        checkMfa(deviceInfo.deviceType, "Unlock", command)
+        deviceInfo.device."${lockUnlockTrait.unlockCommand}"()
+    }
+
+    return [
+        isLocked: command.params.lock as boolean,
+		isJammed: false
+    ]
+}
+
+// OnOff
 @SuppressWarnings('UnusedPrivateMethod')
 private deviceTraitPreferences_OnOff(deviceTrait) {
     section("On/Off Settings") {
@@ -757,6 +1137,86 @@ private deviceTraitPreferences_OnOff(deviceTrait) {
     }
 }
 
+@SuppressWarnings(['UnusedPrivateMethod', 'UnusedPrivateMethodParameter'])
+private attributesForTrait_OnOff(deviceTrait) {
+    return [:]
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private traitFromSettings_OnOff(traitName) {
+    def deviceTrait = [
+        onOffAttribute: settings."${traitName}.onOffAttribute",
+        onValue:        settings."${traitName}.onValue",
+        offValue:       settings."${traitName}.offValue",
+        controlType:    settings."${traitName}.controlType",
+        commands:       ["On", "Off"]
+    ]
+
+    if (deviceTrait.controlType == "single") {
+        deviceTrait.onOffCommand = settings."${traitName}.onOffCommand"
+        deviceTrait.onParam = settings."${traitName}.onParameter"
+        deviceTrait.offParam = settings."${traitName}.offParameter"
+    } else {
+        deviceTrait.onCommand = settings."${traitName}.onCommand"
+        deviceTrait.offCommand = settings."${traitName}.offCommand"
+    }
+    return deviceTrait
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private deleteDeviceTrait_OnOff(deviceTrait) {
+    app.removeSetting("${deviceTrait.name}.onOffAttribute")
+    app.removeSetting("${deviceTrait.name}.onValue")
+    app.removeSetting("${deviceTrait.name}.offValue")
+    app.removeSetting("${deviceTrait.name}.controlType")
+    app.removeSetting("${deviceTrait.name}.onCommand")
+    app.removeSetting("${deviceTrait.name}.offCommand")
+    app.removeSetting("${deviceTrait.name}.onOffCommand")
+    app.removeSetting("${deviceTrait.name}.onParameter")
+    app.removeSetting("${deviceTrait.name}.offParameter")
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private deviceStateForTrait_OnOff(deviceTrait, device) {
+    def isOn
+    if (deviceTrait.onValue) {
+        isOn = device.currentValue(deviceTrait.onOffAttribute) == deviceTrait.onValue
+    } else {
+        isOn = device.currentValue(deviceTrait.onOffAttribute) != deviceTrait.offValue
+    }
+    return [
+        on: isOn
+    ]
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private executeCommand_OnOff(deviceInfo, command) {
+    def onOffTrait = deviceInfo.deviceType.traits.OnOff
+
+    def on
+    def off
+    if (onOffTrait.controlType == "single") {
+        on = { device -> device."${onOffTrait.onOffCommand}"(onOffTrait.onParam) }
+        off = { device -> device."${onOffTrait.onOffCommand}"(onOffTrait.offParam) }
+    } else {
+        on = { device -> device."${onOffTrait.onCommand}"() }
+        off = { device -> device."${onOffTrait.offCommand}"() }
+    }
+
+    def checkValue
+    if (command.params.on) {
+        checkMfa(deviceInfo.deviceType, "On", command)
+        on(deviceInfo.device)
+    } else {
+        checkMfa(deviceInfo.deviceType, "Off", command)
+        off(deviceInfo.device)
+    }
+    return [
+        on: command.params.on as boolean
+    ]
+}
+
+// OpenClose
 @SuppressWarnings('UnusedPrivateMethod')
 private deviceTraitPreferences_OpenClose(deviceTrait) {
     section("Open/Close Settings") {
@@ -834,6 +1294,93 @@ private deviceTraitPreferences_OpenClose(deviceTrait) {
 }
 
 @SuppressWarnings('UnusedPrivateMethod')
+private attributesForTrait_OpenClose(deviceTrait) {
+    return [
+        discreteOnlyOpenClose: deviceTrait.discreteOnlyOpenClose,
+        queryOnlyOpenClose: deviceTrait.queryOnly
+    ]
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private traitFromSettings_OpenClose(traitName) {
+    def openCloseTrait = [
+        discreteOnlyOpenClose: settings."${traitName}.discreteOnlyOpenClose",
+        openCloseAttribute:    settings."${traitName}.openCloseAttribute",
+        // queryOnly may be null for device traits defined with older versions,
+        // so coerce it to a boolean
+        queryOnly:             settings."${traitName}.queryOnly" as boolean,
+        commands:              []
+    ]
+    if (openCloseTrait.discreteOnlyOpenClose) {
+        openCloseTrait.openValue = settings."${traitName}.openValue"
+        openCloseTrait.closedValue = settings."${traitName}.closedValue"
+    }
+
+    if (!openCloseTrait.queryOnly) {
+        if (openCloseTrait.discreteOnlyOpenClose) {
+            openCloseTrait.openCommand = settings."${traitName}.openCommand"
+            openCloseTrait.closeCommand = settings."${traitName}.closeCommand"
+            openCloseTrait.commands += ["Open", "Close"]
+        } else {
+            openCloseTrait.openPositionCommand = settings."${traitName}.openPositionCommand"
+            openCloseTrait.commands << "Set Position"
+        }
+    }
+
+    return openCloseTrait
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private deleteDeviceTrait_OpenClose(deviceTrait) {
+    app.removeSetting("${deviceTrait.name}.discreteOnlyOpenClose")
+    app.removeSetting("${deviceTrait.name}.openCloseAttribute")
+    app.removeSetting("${deviceTrait.name}.openValue")
+    app.removeSetting("${deviceTrait.name}.closedValue")
+    app.removeSetting("${deviceTrait.name}.openCommand")
+    app.removeSetting("${deviceTrait.name}.closeCommand")
+    app.removeSetting("${deviceTrait.name}.openPositionCommand")
+    app.removeSetting("${deviceTrait.name}.queryOnly")
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private deviceStateForTrait_OpenClose(deviceTrait, device) {
+    def openPercent
+    if (deviceTrait.discreteOnlyOpenClose) {
+        def openValues = deviceTrait.openValue.split(",")
+        if (device.currentValue(deviceTrait.openCloseAttribute) in openValues) {
+            openPercent = 100
+        } else {
+            openPercent = 0
+        }
+    } else {
+        openPercent = device.currentValue(deviceTrait.openCloseAttribute)
+    }
+    return [
+        openPercent: openPercent == 99 ? 100 : openPercent
+    ]
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private executeCommand_OpenClose(deviceInfo, command) {
+    def openCloseTrait = deviceInfo.deviceType.traits.OpenClose
+    def openPercent = command.params.openPercent as int
+    if (openCloseTrait.discreteOnlyOpenClose && openPercent == 100) {
+        checkMfa(deviceInfo.deviceType, "Open", command)
+        deviceInfo.device."${openCloseTrait.openCommand}"()
+    } else if (openCloseTrait.discreteOnlyOpenClose && openPercent == 0) {
+        checkMfa(deviceInfo.deviceType, "Close", command)
+        deviceInfo.device."${openCloseTrait.closeCommand}"()
+    } else {
+        checkMfa(deviceInfo.deviceType, "Set Position", command)
+        deviceInfo.device."${openCloseTrait.openPositionCommand}"(openPercent)
+    }
+    return [
+        openPercent: openPercent
+    ]
+}
+
+// Rotation
+@SuppressWarnings('UnusedPrivateMethod')
 def deviceTraitPreferences_Rotation(deviceTrait) {
     section("Rotation Preferences") {
         input(
@@ -858,35 +1405,328 @@ def deviceTraitPreferences_Rotation(deviceTrait) {
 }
 
 @SuppressWarnings('UnusedPrivateMethod')
-def deviceTraitPreferences_Scene(deviceTrait) {
-    section("Scene Preferences") {
+private attributesForTrait_Rotation(deviceTrait) {
+    return [
+        supportsContinuousRotation: deviceTrait.continuousRotation,
+        supportsPercent:            true,
+        supportsDegrees:            false
+    ]
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private traitFromSettings_Rotation(traitName) {
+    return [
+        rotationAttribute:  settings."${traitName}.rotationAttribute",
+        setRotationCommand: settings."${traitName}.setRotationCommand",
+        continuousRotation: settings."${traitName}.continuousRotation",
+        commands:        ["Rotate"]
+    ]
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private deleteDeviceTrait_Rotation(deviceTrait) {
+    app.removeSetting("${deviceTrait.name}.rotationAttribute")
+    app.removeSetting("${deviceTrait.name}.setRotationCommand")
+    app.removeSetting("${deviceTrait.name}.continuousRotation")
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private deviceStateForTrait_Rotation(deviceTrait, device) {
+    return [
+        rotationPercent: device.currentValue(deviceTrait.rotationAttribute)
+    ]
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private executeCommand_RotateAbsolute(deviceInfo, command) {
+    checkMfa(deviceInfo.deviceType, "Rotate", command)
+    def rotationTrait = deviceInfo.deviceType.traits.Rotation
+    def position = command.params.rotationPercent
+
+    deviceInfo.device."${rotationTrait.setRotationCommand}"(position)
+    return [
+        rotationPercent: position
+    ]
+}
+
+// FanSpeed
+@SuppressWarnings('UnusedPrivateMethod')
+private deviceTraitPreferences_FanSpeed(deviceTrait) {
+    hubitatFanSpeeds = [
+        "low":         "Low",
+        "medium-low":  "Medium-Low",
+        "medium":      "Medium",
+        "medium-high": "Medium-High",
+        "high":        "High",
+        "auto":        "Auto",
+    ]
+    section("Fan Speed Settings") {
         input(
-            name: "${deviceTrait.name}.activateCommand",
-            title: "Activate Command",
+            name: "${deviceTrait.name}.currentSpeedAttribute",
+            title: "Current Speed Attribute",
             type: "text",
-            defaultValue: "on",
+            defaultValue: "speed",
             required: true
         )
         input(
-            name: "${deviceTrait.name}.sceneReversible",
-            title: "Can this scene be deactivated?",
-            type: "bool",
-            defaultValue: false,
+            name: "${deviceTrait.name}.setFanSpeedCommand",
+            title: "Set Speed Command",
+            type: "text",
+            defaultValue: "setSpeed",
+            required: true
+        )
+        input(
+            name: "${deviceTrait.name}.fanSpeeds",
+            title: "Supported Fan Speeds",
+            type: "enum",
+            options: hubitatFanSpeeds,
+            multiple: true,
             required: true,
             submitOnChange: true
         )
-        if (settings."${deviceTrait.name}.sceneReversible") {
+        deviceTrait.fanSpeeds.each { fanSpeed ->
             input(
-                name: "${deviceTrait.name}.deactivateCommand",
-                title: "Deactivate Command",
+                name: "${deviceTrait.name}.speed.${fanSpeed.key}.googleNames",
+                title: "Google Home Level Names for ${hubitatFanSpeeds[fanSpeed.key]}",
+                description: "A comma-separated list of names that the Google Assistant will " +
+                             "accept for this speed setting",
                 type: "text",
-                defaultValue: "off",
+                required: "true",
+                defaultValue: hubitatFanSpeeds[fanSpeed.key]
+            )
+        }
+    }
+
+    section("Reverse Settings") {
+        input(
+            name: "${deviceTrait.name}.reversible",
+            title: "Reversible",
+            type: "bool",
+            defaultValue: false,
+            submitOnChange: true
+        )
+
+        if (settings."${deviceTrait.name}.reversible") {
+            input(
+                name: "${deviceTrait.name}.reverseCommand",
+                title: "Reverse Command",
+                type: "text",
                 required: true
             )
         }
     }
 }
 
+@SuppressWarnings('UnusedPrivateMethod')
+private attributesForTrait_FanSpeed(deviceTrait) {
+    def fanSpeedAttrs = [
+        availableFanSpeeds: [
+            speeds: deviceTrait.fanSpeeds.collect { hubitatLevelName, googleLevelNames ->
+                def speeds = googleLevelNames.split(",")
+                [
+                    speed_name: hubitatLevelName,
+                    speed_values: [
+                        [
+                            speed_synonym: speeds,
+                            lang: "en"
+                        ]
+                    ]
+                ]
+            },
+            ordered: true
+        ],
+        reversible: deviceTrait.reversible
+    ]
+    return fanSpeedAttrs
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private traitFromSettings_FanSpeed(traitName) {
+    def fanSpeedMapping = [
+        currentSpeedAttribute: settings."${traitName}.currentSpeedAttribute",
+        setFanSpeedCommand:    settings."${traitName}.setFanSpeedCommand",
+        fanSpeeds:             [:],
+        reversible:            settings."${traitName}.reversible",
+        commands:              ["Set Fan Speed"]
+    ]
+    if (fanSpeedMapping.reversible) {
+        fanSpeedMapping.reverseCommand = settings."${traitName}.reverseCommand"
+        fanSpeedMapping.commands << "Reverse"
+    }
+    settings."${traitName}.fanSpeeds"?.each { fanSpeed ->
+        fanSpeedMapping.fanSpeeds[fanSpeed] = settings."${traitName}.speed.${fanSpeed}.googleNames"
+    }
+
+    return fanSpeedMapping
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private deleteDeviceTrait_FanSpeed(deviceTrait) {
+    app.removeSetting("${deviceTrait.name}.currentSpeedAttribute")
+    app.removeSetting("${deviceTrait.name}.setFanSpeedCommand")
+    app.removeSetting("${deviceTrait.name}.reversible")
+    app.removeSetting("${deviceTrait.name}.reverseCommand")
+    deviceTrait.fanSpeeds.each { fanSpeed, googleNames ->
+        app.removeSetting("${deviceTrait.name}.speed.${fanSpeed}.googleNames")
+    }
+    app.removeSetting("${deviceTrait.name}.fanSpeeds")
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private deviceStateForTrait_FanSpeed(deviceTrait, device) {
+    def currentSpeed = device.currentValue(deviceTrait.currentSpeedAttribute)
+
+    return [
+        currentFanSpeedSetting: currentSpeed
+    ]
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private executeCommand_SetFanSpeed(deviceInfo, command) {
+    checkMfa(deviceInfo.deviceType, "Set Fan Speed", command)
+    def fanSpeedTrait = deviceInfo.deviceType.traits.FanSpeed
+    def fanSpeed = command.params.fanSpeed
+
+    deviceInfo.device."${fanSpeedTrait.setFanSpeedCommand}"(fanSpeed)
+    return [
+        currentFanSpeedSetting: fanSpeed
+    ]
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private executeCommand_Reverse(deviceInfo, command) {
+    checkMfa(deviceInfo.deviceType, "Reverse", command)
+    def fanSpeedTrait = deviceInfo.deviceType.traits.FanSpeed
+    deviceInfo.device."${fanSpeedTrait.reverseCommand}"()
+    return [:]
+}
+
+// HumiditySetting
+@SuppressWarnings('UnusedPrivateMethod')
+private deviceTraitPreferences_HumiditySetting(deviceTrait) {
+    section("Humidity Setting Preferences") {
+        input(
+            name: "${deviceTrait.name}.humidityAttribute",
+            title: "Humidity Attribute",
+            type: "text",
+            defaultValue: "humidity",
+            required: true
+        )
+        input(
+            name: "${deviceTrait.name}.queryOnly",
+            title: "Query Only Humidity",
+            type: "bool",
+            defaultValue: false,
+            require: true,
+            submitOnChange: true
+        )
+        if (!deviceTrait.queryOnly) {
+            input(
+                name: "${deviceTrait.name}.humiditySetpointAttribute",
+                title: "Humidity Setpoint Attribute",
+                type: "text",
+                required: true
+            )
+            input(
+                name: "${deviceTrait.name}.setHumidityCommand",
+                title: "Set Humidity Command",
+                type: "text",
+                required: true
+            )
+            paragraph("If either a minimum or maximum humidity setpoint is configured then the other must be as well")
+            input(
+                name: "${deviceTrait.name}.humidityRange.min",
+                title: "Minimum Humidity Setpoint",
+                type: "number",
+                required: deviceTrait.humidityRange?.max != null,
+                submitOnChange: true
+            )
+            input(
+                name: "${deviceTrait.name}.humidityRange.max",
+                title: "Maximum Humidity Setpoint",
+                type: "number",
+                required: deviceTrait.humidityRange?.min != null,
+                submitOnChange: true
+            )
+        }
+    }
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private attributesForTrait_HumiditySetting(deviceTrait) {
+    def attrs = [
+        queryOnlyHumiditySetting: deviceTrait.queryOnly
+    ]
+    if (deviceTrait.humidityRange) {
+        attrs.humiditySetpointRange = [
+            minPercent: deviceTrait.humidityRange.min,
+            maxPercent: deviceTrait.humidityRange.max
+        ]
+    }
+    return attrs
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private traitFromSettings_HumiditySetting(traitName) {
+    def humidityTrait = [
+        humidityAttribute: settings."${traitName}.humidityAttribute",
+        queryOnly:         settings."${traitName}.queryOnly",
+        commands:          []
+    ]
+    if (!humidityTrait.queryOnly) {
+        humidityTrait << [
+            humiditySetpointAttribute: settings."${traitName}.humiditySetpointAttribute",
+            setHumidityCommand:        settings."${traitName}.setHumidityCommand"
+        ]
+        humidityTrait.commands << "Set Humidity"
+
+        def humidityRange = [
+            min: settings."${traitName}.humidityRange.min",
+            max: settings."${traitName}.humidityRange.max"
+        ]
+        if (humidityRange.min != null || humidityRange.max != null) {
+            humidityTrait << [
+                humidityRange: humidityRange
+            ]
+        }
+    }
+    return humidityTrait
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private deleteDeviceTrait_HumiditySetting(deviceTrait) {
+    app.removeSetting("${deviceTrait.name}.humidityAttribute")
+    app.removeSetting("${deviceTrait.name}.humiditySetpointAttribute")
+    app.removeSetting("${deviceTrait.name}.setHumidityCommand")
+    app.removeSetting("${deviceTrait.name}.humidityRange.min")
+    app.removeSetting("${deviceTrait.name}.humidityRange.max")
+    app.removeSetting("${deviceTrait.name}.queryOnly")
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private deviceStateForTrait_HumiditySetting(deviceTrait, device) {
+    def deviceState = [
+        humidityAmbientPercent: Math.round(device.currentValue(deviceTrait.humidityAttribute))
+    ]
+    if (!deviceTrait.queryOnly) {
+        deviceState.humiditySetpointPercent = Math.round(device.currentValue(deviceTrait.humiditySetpointAttribute))
+    }
+    return deviceState
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private executeCommand_SetHumidity(deviceInfo, command) {
+    checkMfa(deviceInfo.deviceType, "Set Humidity", command)
+    def humiditySettingTrait = deviceInfo.deviceType.traits.HumiditySetting
+    def humiditySetpoint = command.params.humidity
+
+    deviceInfo.device."${humiditySettingTrait.setHumidityCommand}"(humiditySetpoint)
+    return [
+        humiditySetpointPercent: humiditySetpoint
+    ]
+}
+
+// TemperatureControl
 @SuppressWarnings('UnusedPrivateMethod')
 def deviceTraitPreferences_TemperatureControl(deviceTrait) {
     section ("Temperature Control Preferences") {
@@ -950,6 +1790,282 @@ def deviceTraitPreferences_TemperatureControl(deviceTrait) {
     }
 }
 
+@SuppressWarnings('UnusedPrivateMethod')
+private attributesForTrait_TemperatureControl(deviceTrait) {
+    def attrs = [
+        temperatureUnitForUX:        deviceTrait.temperatureUnit,
+        queryOnlyTemperatureControl: deviceTrait.queryOnly
+    ]
+
+    if (!deviceTrait.queryOnly) {
+        if (deviceTrait.temperatureUnit == "C") {
+            attrs.temperatureRange = [
+                minThresholdCelsius: deviceTrait.minTemperature,
+                maxThresholdCelsius: deviceTrait.maxTemperature
+            ]
+        } else {
+            attrs.temperatureRange = [
+                minThresholdCelsius: fahrenheitToCelsiusRounded(deviceTrait.minTemperature),
+                maxThresholdCelsius: fahrenheitToCelsiusRounded(deviceTrait.maxTemperature)
+            ]
+        }
+
+        if (deviceTrait.temperatureStep) {
+            if (deviceTrait.temperatureUnit == "C") {
+                attrs.temperatureStepCelsius = deviceTrait.temperatureStep
+            } else {
+                // 5/9 is the scale factor for converting from F to C
+                attrs.temperatureStepCelsius = deviceTrait.temperatureStep * (5 / 9)
+            }
+        }
+    }
+
+    return attrs
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private traitFromSettings_TemperatureControl(traitName) {
+    def tempControlTrait = [
+        temperatureUnit:             settings."${traitName}.temperatureUnit",
+        currentTemperatureAttribute: settings."${traitName}.currentTemperatureAttribute",
+        queryOnly:                   settings."${traitName}.queryOnly",
+        commands:                    []
+    ]
+
+    if (!tempControlTrait.queryOnly) {
+        tempControlTrait << [
+            currentSetpointAttribute: settings."${traitName}.setpointAttribute",
+            setTemperatureCommand:    settings."${traitName}.setTemperatureCommand",
+            // Min and Max temperature used the wrong input type originally, so coerce them
+            // from String to BigDecimal if this trait was saved with a broken version
+            minTemperature:           settings."${traitName}.minTemperature" as BigDecimal,
+            maxTemperature:           settings."${traitName}.maxTemperature" as BigDecimal
+        ]
+        tempControlTrait.commands << "Set Temperature"
+
+        def temperatureStep = settings."${traitName}.temperatureStep"
+        if (temperatureStep) {
+            // Temperature step used the wrong input type originally, so coerce them
+            // from String to BigDecimal if this trait was saved with a broken version
+            tempControlTrait.temperatureStep = temperatureStep as BigDecimal
+        }
+    }
+
+    return tempControlTrait
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private deleteDeviceTrait_TemperatureControl(deviceTrait) {
+    app.removeSetting("${deviceTrait.name}.temperatureUnit")
+    app.removeSetting("${deviceTrait.name}.currentTemperatureAttribute")
+    app.removeSetting("${deviceTrait.name}.queryOnly")
+    app.removeSetting("${deviceTrait.name}.setpointAttribute")
+    app.removeSetting("${deviceTrait.name}.setTemperatureCommand")
+    app.removeSetting("${deviceTrait.name}.minTemperature")
+    app.removeSetting("${deviceTrait.name}.maxTemperature")
+    app.removeSetting("${deviceTrait.name}.temperatureStep")
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private deviceStateForTrait_TemperatureControl(deviceTrait, device) {
+    def currentTemperature = device.currentValue(deviceTrait.currentTemperatureAttribute)
+    if (deviceTrait.temperatureUnit == "F") {
+        currentTemperature = fahrenheitToCelsiusRounded(currentTemperature)
+    }
+    def state = [
+        temperatureAmbientCelsius: currentTemperature
+    ]
+
+    if (deviceTrait.queryOnly) {
+        state.temperatureSetpointCelsius = currentTemperature
+    } else {
+        def setpoint = device.currentValue(deviceTrait.setpointAttribute)
+        if (deviceTrait.temperatureUnit == "F") {
+            setpoint = fahrenheitToCelsiusRounded(setpoint)
+        }
+        state.temperatureSetpiontCelsius = setpoint
+    }
+
+    return state
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private executeCommand_SetTemperature(deviceInfo, command) {
+    checkMfa(deviceInfo.deviceTrait, "Set Temperature", command)
+    def temperatureControlTrait = deviceInfo.deviceType.traits.TemperatureControl
+    def setpoint = command.params.temperature
+    if (temperatureControlTrait.temperatureUnit == "F") {
+        setpoint = celsiusToFahrenheitRounded(setpoint)
+    }
+    deviceInfo.device."${temperatureControlTrait.setTemperatureCommand}"(setpoint)
+
+    return [
+        temperatureSetpiontCelsius: setpoint
+    ]
+}
+
+// Toggles
+@SuppressWarnings('UnusedPrivateMethod')
+private deviceTraitPreferences_Toggles(deviceTrait) {
+    section("Toggles") {
+        deviceTrait.toggles.each { toggle ->
+            href(
+                title: "${toggle.labels.join(",")}",
+                description: "Click to edit",
+                style: "page",
+                page: "togglePreferences",
+                params: toggle
+            )
+        }
+        href(
+            title: "New Toggle",
+            description: "",
+            style: "page",
+            page: "togglePreferences",
+            params: [
+                traitName: deviceTrait.name,
+                name: "${deviceTrait.name}.toggles.${UUID.randomUUID().toString()}"
+            ]
+        )
+    }
+}
+
+def togglePreferences(toggle) {
+    def toggles = settings."${toggle.traitName}.toggles" ?: []
+    if (!(toggle.name in toggles)) {
+        toggles << toggle.name
+        app.updateSetting("${toggle.traitName}.toggles", toggles)
+    }
+    return dynamicPage(name: "togglePreferences", title: "Toggle Preferences", nextPage: "deviceTraitPreferences") {
+        section {
+            input(
+                name: "${toggle.name}.labels",
+                title: "Toggle Names",
+                description: "A comma-separated list of names for this toggle",
+                type: "text",
+                required: true
+            )
+        }
+
+        deviceTraitPreferences_OnOff(toggle)
+
+        section {
+            href(
+                description: "",
+                style: "page",
+                page: "toggleDelete",
+                params: toggle
+            )
+        }
+    }
+}
+
+def toggleDelete(toggle) {
+    return dynamicPage(name: "toggleDelete", title: "Toggle Deleted", nextPage: "deviceTraitPreferences") {
+        deleteToggle(toggle)
+        section {
+            paragraph("The ${toggle.labels ? toggle.labels.join(",") : "new"} toggle has been removed")
+        }
+    }
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private attributesForTrait_Toggles(deviceTrait) {
+    return [
+        availableToggles: deviceTrait.toggles.collect { toggle ->
+            [
+                name: toggle.name,
+                name_values: [
+                    [
+                        name_synonym: toggle.labels,
+                        lang: "en"
+                    ]
+                ]
+            ]
+        }
+    ]
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private traitFromSettings_Toggles(traitName) {
+    def togglesTrait = [
+        toggles:  [],
+        commands: [],
+    ]
+    def toggles = settings."${traitName}.toggles"?.collect { toggle ->
+        def toggleAttrs = [
+            name: toggle,
+            traitName: traitName,
+            labels: settings."${toggle}.labels"?.split(",")
+        ]
+        toggleAttrs << traitFromSettings_OnOff(toggle)
+        toggleAttrs
+    }
+    if (toggles) {
+        togglesTrait.toggles = toggles
+        toggles.each { toggle ->
+            togglesTrait.commands += [
+                "${toggle.labels[0]} On" as String,
+                "${toggle.labels[0]} Off" as String
+            ]
+        }
+    }
+    return togglesTrait
+}
+
+private deleteToggle(toggle) {
+    LOGGER.debug("Deleting toggle: ${toggle}")
+    def toggles = settings."${toggle.traitName}.toggles"
+    toggles.remove(toggle.name)
+    app.updateSetting("${toggle.traitName}.toggles", toggles)
+    app.removeSetting("${toggle.name}.labels")
+    deleteDeviceTrait_OnOff(toggle)
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private deleteDeviceTrait_Toggles(deviceTrait) {
+    deviceTrait.toggles.each { toggle ->
+        deleteToggle(toggle)
+    }
+    app.removeSetting("${deviceTrait.name}.toggles")
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private deviceStateForTrait_Toggles(deviceTrait, device) {
+    return [
+        currentToggleSettings: deviceTrait.toggles.collectEntries { toggle ->
+            [toggle.name, deviceStateForTrait_OnOff(toggle, device).on]
+        }
+    ]
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private executeCommand_SetToggles(deviceInfo, command) {
+    def togglesTrait = deviceInfo.deviceType.traits.Toggles
+    def togglesToSet = command.params.updateToggleSettings
+
+    def statesToCheck = [:]
+    togglesToSet.each { toggleName, toggleValue ->
+        def toggle = togglesTrait.toggles.find { it.name == toggleName }
+        def fakeDeviceInfo = [
+            deviceType: [
+                traits: [
+                    // We're delegating to the OnOff handler, so we need
+                    // to fake the OnOff trait.
+                    OnOff: toggle
+                ]
+            ],
+            device: deviceInfo.device
+        ]
+        checkMfa(deviceInfo.deviceType, "${toggle.labels[0]} ${toggleValue ? "On" : "Off"}", command)
+        // Return empty for now until we can figure out a better way of providing the desired state
+        //statesToCheck << executeCommand_OnOff(fakeDeviceInfo, [params: [on: toggleValue]])
+		executeCommand_OnOff(fakeDeviceInfo, [params: [on: toggleValue]])
+    }
+    return statesToCheck
+}
+
+// TemperatureSetting / Thermostat
 @SuppressWarnings('UnusedPrivateMethod')
 def deviceTraitPreferences_TemperatureSetting(deviceTrait) {
     section ("Temperature Setting Preferences") {
@@ -1141,1069 +2257,6 @@ private temperatureSettingControlPreferences(deviceTrait) {
 }
 
 @SuppressWarnings('UnusedPrivateMethod')
-private deviceTraitPreferences_Toggles(deviceTrait) {
-    section("Toggles") {
-        deviceTrait.toggles.each { toggle ->
-            href(
-                title: "${toggle.labels.join(",")}",
-                description: "Click to edit",
-                style: "page",
-                page: "togglePreferences",
-                params: toggle
-            )
-        }
-        href(
-            title: "New Toggle",
-            description: "",
-            style: "page",
-            page: "togglePreferences",
-            params: [
-                traitName: deviceTrait.name,
-                name: "${deviceTrait.name}.toggles.${UUID.randomUUID().toString()}"
-            ]
-        )
-    }
-}
-
-def togglePreferences(toggle) {
-    def toggles = settings."${toggle.traitName}.toggles" ?: []
-    if (!(toggle.name in toggles)) {
-        toggles << toggle.name
-        app.updateSetting("${toggle.traitName}.toggles", toggles)
-    }
-    return dynamicPage(name: "togglePreferences", title: "Toggle Preferences", nextPage: "deviceTraitPreferences") {
-        section {
-            input(
-                name: "${toggle.name}.labels",
-                title: "Toggle Names",
-                description: "A comma-separated list of names for this toggle",
-                type: "text",
-                required: true
-            )
-        }
-
-        deviceTraitPreferences_OnOff(toggle)
-
-        section {
-            href(
-                title: "Remove Toggle",
-                description: "",
-                style: "page",
-                page: "toggleDelete",
-                params: toggle
-            )
-        }
-    }
-}
-
-def toggleDelete(toggle) {
-    return dynamicPage(name: "toggleDelete", title: "Toggle Deleted", nextPage: "deviceTraitPreferences") {
-        deleteToggle(toggle)
-        section {
-            paragraph("The ${toggle.labels ? toggle.labels.join(",") : "new"} toggle has been removed")
-        }
-    }
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private deviceTraitPreferences_Volume(deviceTrait) {
-    section("Volume Preferences") {
-        input(
-            name: "${deviceTrait.name}.volumeAttribute",
-            title: "Current Volume Attribute",
-            type: "text",
-            required: true,
-            defaultValue: "volume"
-        )
-        input(
-            name: "${deviceTrait.name}.setVolumeCommand",
-            title: "Set Rotation Command",
-            type: "text",
-            required: true,
-            defaultValue: "setVolume"
-        )
-        input(
-            name: "${deviceTrait.name}.volumeStep",
-            title: "Volume Level Step",
-            type: "number",
-            required: true,
-            defaultValue: 1
-        )
-        input(
-            name: "${deviceTrait.name}.canMuteUnmute",
-            title: "Supports Mute And Unmute",
-            type: "bool",
-            defaultValue: true,
-            submitOnChange: true
-        )
-        if (deviceTrait.canMuteUnmute) {
-            input(
-                name: "${deviceTrait.name}.muteAttribute",
-                title: "Mute State Attribute",
-                type: "text",
-                required: true,
-                defaultValue: "mute"
-            )
-            input(
-                name: "${deviceTrait.name}.mutedValue",
-                title: "Muted Value",
-                type: "text",
-                required: true,
-                defaultValue: "muted"
-            )
-            input(
-                name: "${deviceTrait.name}.unmutedValue",
-                title: "Unmuted Value",
-                type: "text",
-                required: true,
-                defaultValue: "unmuted"
-            )
-            input(
-                name: "${deviceTrait.name}.muteCommand",
-                title: "Mute Command",
-                type: "text",
-                required: true,
-                defaultValue: "mute"
-            )
-            input(
-                name: "${deviceTrait.name}.unmuteCommand",
-                title: "Unmute Command",
-                type: "text",
-                required: true,
-                defaultValue: "unmute"
-            )
-        }
-    }
-}
-
-def handleAction() {
-    LOGGER.debug(request.JSON)
-    def requestType = request.JSON.inputs[0].intent
-    if (requestType == "action.devices.SYNC") {
-        return handleSyncRequest(request)
-    } else if (requestType == "action.devices.QUERY") {
-        return handleQueryRequest(request)
-    } else if (requestType == "action.devices.EXECUTE") {
-        return handleExecuteRequest(request)
-    } else if (requestType == "action.devices.DISCONNECT") {
-        return [:]
-    }
-}
-
-private attributeHasExpectedValue(device, attrName, attrValue) {
-    def currentValue = device.currentValue(attrName, true)
-    if (attrValue instanceof Closure) {
-        if (!attrValue(currentValue)) {
-            LOGGER.debug("${device.name}: Expected value test returned false for " +
-                         "attribute ${attrName} with value ${currentValue}")
-            return false
-        }
-    } else if (currentValue != attrValue) {
-        LOGGER.debug("${device.name}: current value of ${attrName} (${currentValue}) " +
-                     "does does not yet match expected value (${attrValue})")
-        return false
-    }
-    return true
-}
-
-private handleExecuteRequest(request) {
-    def resp = [
-        requestId: request.JSON.requestId,
-        payload: [
-            commands: []
-        ]
-    ]
-
-    def knownDevices = allKnownDevices()
-    def commands = request.JSON.inputs[0].payload.commands
-
-    commands.each { command ->
-        def devices = command.devices.collect { device -> knownDevices."${device.id}" }
-        def attrsToAwait = [:].withDefault { [:] }
-        def results = [:]
-        // Send appropriate commands to devices
-        devices.each { device ->
-            command.execution.each { execution ->
-                def commandName = execution.command.split("\\.").last()
-                try {
-                    attrsToAwait[device.device] += "executeCommand_${commandName}"(device, execution)
-                    results[device.device] = [
-                        status: "SUCCESS"
-                    ]
-                } catch (Exception ex) {
-                    results[device.device] = [
-                        status: "ERROR"
-                    ]
-                    try {
-                        results[device.device] << parseJson(ex.message)
-                    } catch (JsonException jex) {
-                        LOGGER.exception(
-                            "Error executing command ${commandName} on device ${device.device.name}",
-                            ex
-                        )
-                        results[device.device] << [
-                            errorCode: "hardError"
-                        ]
-                    }
-                }
-            }
-        }
-        // Wait up to 5 seconds for devices to report their new state
-        for (def i = 0; i < 50; ++i) {
-            def ready = attrsToAwait.every { device, attributes ->
-                attributes.every { attrName, attrValue ->
-                    attributeHasExpectedValue(device, attrName, attrValue)
-                }
-            }
-            if (ready) {
-                break
-            } else {
-                pauseExecution(100)
-            }
-        }
-        // Now build our response message
-        devices.each { device ->
-            def result = results[device.device]
-            result.ids = [device.device.id]
-            if (result.status == "SUCCESS") {
-                def deviceState = [
-                    online: true
-                ]
-                device.deviceType.traits.each { traitType, deviceTrait ->
-                    deviceState += "deviceStateForTrait_${traitType}"(deviceTrait, device.device)
-                }
-                result.states = deviceState
-            }
-            resp.payload.commands << result
-        }
-    }
-
-    LOGGER.debug(resp)
-    return resp
-}
-
-private checkMfa(deviceType, commandType, command) {
-    commandType = commandType as String
-    LOGGER.debug("Checking MFA for ${commandType} command")
-    if (commandType in deviceType.confirmCommands && !command.challenge?.ack) {
-        throw new Exception(JsonOutput.toJson([
-            errorCode: "challengeNeeded",
-            challengeNeeded: [
-                type: "ackNeeded"
-            ]
-        ]))
-    }
-    if (commandType in deviceType.secureCommands) {
-        def globalPinCodes = deviceTypeFromSettings('GlobalPinCodes')
-        if (!command.challenge?.pin) {
-            throw new Exception(JsonOutput.toJson([
-                errorCode: "challengeNeeded",
-                challengeNeeded: [
-                    type: "pinNeeded"
-                ]
-            ]))
-        } else if (!(command.challenge.pin in deviceType.pinCodes*.value)
-                   && !(command.challenge.pin in globalPinCodes.pinCodes*.value)) {
-            throw new Exception(JsonOutput.toJson([
-                errorCode: "challengeNeeded",
-                challengeNeeded: [
-                    type: "challengeFailedPinNeeded"
-                ]
-            ]))
-        }
-    }
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private controlScene(options) {
-    def allDevices = allKnownDevices()
-    def device = allDevices[options.deviceId].device
-    device."${options.command}"()
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private executeCommand_ActivateScene(deviceInfo, command) {
-    def sceneTrait = deviceInfo.deviceType.traits.Scene
-    if (sceneTrait.name == "hubitat_mode") {
-        location.mode = deviceInfo.device.name
-    } else {
-        if (command.params.deactivate) {
-            checkMfa(deviceInfo.deviceType, "Deactivate Scene", command)
-            runIn(
-                0,
-                "controlScene",
-                [
-                    data: [
-                        "deviceId": deviceInfo.device.id,
-                        "command": sceneTrait.deactivateCommand
-                    ]
-                ]
-            )
-        } else {
-            checkMfa(deviceInfo.deviceType, "Activate Scene", command)
-            runIn(
-                0,
-                "controlScene",
-                [
-                    data: [
-                        "deviceId": deviceInfo.device.id,
-                        "command": sceneTrait.activateCommand
-                    ]
-                ]
-            )
-        }
-    }
-    return [:]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private executeCommand_BrightnessAbsolute(deviceInfo, command) {
-    checkMfa(deviceInfo.deviceType, "Set Brightness", command)
-    def brightnessTrait = deviceInfo.deviceType.traits.Brightness
-    // Google uses 0...100 for brightness but hubitat uses 0...99, so clamp
-    def brightnessToSet = Math.min(command.params.brightness, 99)
-
-    deviceInfo.device."${brightnessTrait.setBrightnessCommand}"(brightnessToSet)
-    return [
-        (brightnessTrait.brightnessAttribute): brightnessToSet
-    ]
-}
-
-@SuppressWarnings(['UnusedPrivateMethod', 'UnusedPrivateMethodParameter'])
-private executeCommand_GetCameraStream(deviceInfo, command) {
-    return [:]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private executeCommand_ColorAbsolute(deviceInfo, command) {
-    checkMfa(deviceInfo.deviceType, "Set Color", command)
-    def colorTrait = deviceInfo.deviceType.traits.ColorSetting
-
-    def checkAttrs = [:]
-    if (command.params.color.temperature) {
-        def temperature = command.params.color.temperature
-        deviceInfo.device."${colorTrait.setColorTemperatureCommand}"(temperature)
-        checkAttrs << [
-            (colorTrait.colorTemperatureAttribute): temperature
-        ]
-        if (colorTrait.fullSpectrum && colorTrait.colorTemperature) {
-            checkAttrs << [
-                (colorTrait.colorModeAttribute): colorTrait.temperatureModeValue
-            ]
-        }
-    } else if (command.params.color.spectrumHSV) {
-        def hsv = command.params.color.spectrumHSV
-        // Google sends hue in degrees (0...360), but hubitat wants it in the range 0...100
-        def hue = Math.round(hsv.hue * 100 / 360)
-        // Google sends saturation and value as floats in the range 0...1,
-        // but Hubitat wants them in the range 0...100
-        def saturation = Math.round(hsv.saturation * 100)
-        def value = Math.round(hsv.value * 100)
-
-        deviceInfo.device."${colorTrait.setColorCommand}"([
-            hue:        hue,
-            saturation: saturation,
-            level:      value
-        ])
-        checkAttrs << [
-            (colorTrait.hueAttribute):        hue,
-            (colorTrait.saturationAttribute): saturation,
-            (colorTrait.levelAttribute):      value
-        ]
-        if (colorTrait.fullSpectrum && colorTrait.colorTemperature) {
-            checkAttrs << [
-                (colorTrait.colorModeAttribute): colorTrait.fullSpectrumModeValue
-            ]
-        }
-    }
-    return checkAttrs
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private executeCommand_Reverse(deviceInfo, command) {
-    checkMfa(deviceInfo.deviceType, "Reverse", command)
-    def fanSpeedTrait = deviceInfo.deviceType.traits.FanSpeed
-    deviceInfo.device."${fanSpeedTrait.reverseCommand}"()
-    return [:]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private executeCommand_LockUnlock(deviceInfo, command) {
-    def lockUnlockTrait = deviceInfo.deviceType.traits.LockUnlock
-    def checkValue
-    if (command.params.lock) {
-        checkMfa(deviceInfo.deviceType, "Lock", command)
-        checkValue = lockUnlockTrait.lockedValue
-        deviceInfo.device."${lockUnlockTrait.lockCommand}"()
-    } else {
-        checkMfa(deviceInfo.deviceType, "Unlock", command)
-        checkValue = { it != lockUnlockTrait.lockedValue }
-        deviceInfo.device."${lockUnlockTrait.unlockCommand}"()
-    }
-
-    return [
-        (lockUnlockTrait.lockedUnlockedAttribute): checkValue
-    ]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private executeCommand_mute(deviceInfo, command) {
-    def volumeTrait = deviceInfo.deviceType.traits.Volume
-    def checkValue
-    if (command.params.mute) {
-        checkMfa(deviceInfo.deviceType, "Mute", command)
-        deviceInfo.device."${volumeTrait.muteCommand}"()
-        checkValue = volumeTrait.mutedValue
-    } else {
-        checkMfa(deviceInfo.deviceType, "Unmute", command)
-        deviceInfo.device."${volumeTrait.unmuteCommand}"()
-        checkValue = volumeTrait.unmutedValue
-    }
-
-    return [
-        (volumeTrait.muteAttribute): checkValue
-    ]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private executeCommand_OnOff(deviceInfo, command) {
-    def onOffTrait = deviceInfo.deviceType.traits.OnOff
-
-    def on
-    def off
-    if (onOffTrait.controlType == "single") {
-        on = { device -> device."${onOffTrait.onOffCommand}"(onOffTrait.onParam) }
-        off = { device -> device."${onOffTrait.onOffCommand}"(onOffTrait.offParam) }
-    } else {
-        on = { device -> device."${onOffTrait.onCommand}"() }
-        off = { device -> device."${onOffTrait.offCommand}"() }
-    }
-
-    def checkValue
-    if (command.params.on) {
-        checkMfa(deviceInfo.deviceType, "On", command)
-        on(deviceInfo.device)
-        if (onOffTrait.onValue) {
-            checkValue = onOffTrait.onValue
-        } else {
-            checkValue = { it != onOffTrait.offValue }
-        }
-    } else {
-        checkMfa(deviceInfo.deviceType, "Off", command)
-        off(deviceInfo.device)
-        if (onOffTrait.onValue) {
-            checkValue = onOffTrait.offValue
-        } else {
-            checkValue = { it != onOffTrait.onValue }
-        }
-    }
-    return [
-        (onOffTrait.onOffAttribute): checkValue
-    ]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private executeCommand_OpenClose(deviceInfo, command) {
-    def openCloseTrait = deviceInfo.deviceType.traits.OpenClose
-    def openPercent = command.params.openPercent as int
-    def checkValue
-    if (openCloseTrait.discreteOnlyOpenClose && openPercent == 100) {
-        checkMfa(deviceInfo.deviceType, "Open", command)
-        deviceInfo.device."${openCloseTrait.openCommand}"()
-        checkValue = { it in openCloseTrait.openValue.split(",") }
-    } else if (openCloseTrait.discreteOnlyOpenClose && openPercent == 0) {
-        checkMfa(deviceInfo.deviceType, "Close", command)
-        deviceInfo.device."${openCloseTrait.closeCommand}"()
-        checkValue = { it in openCloseTrait.closedValue.split(",") }
-    } else {
-        checkMfa(deviceInfo.deviceType, "Set Position", command)
-        // Google uses 0...100 for position but hubitat uses 0...99, so clamp
-        openPercent = Math.min(openPercent, 99)
-        deviceInfo.device."${openCloseTrait.openPositionCommand}"(openPercent)
-        checkValue = openPercent
-    }
-    return [
-        (openCloseTrait.openCloseAttribute): checkValue
-    ]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private executeCommand_RotateAbsolute(deviceInfo, command) {
-    checkMfa(deviceInfo.deviceType, "Rotate", command)
-    def rotationTrait = deviceInfo.deviceType.traits.Rotation
-    def position = command.params.rotationPercent
-
-    deviceInfo.device."${rotationTrait.setRotationCommand}"(position)
-    return [
-        (rotationTrait.rotationAttribute): position
-    ]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private executeCommand_SetFanSpeed(deviceInfo, command) {
-    checkMfa(deviceInfo.deviceType, "Set Fan Speed", command)
-    def fanSpeedTrait = deviceInfo.deviceType.traits.FanSpeed
-    def fanSpeed = command.params.fanSpeed
-
-    deviceInfo.device."${fanSpeedTrait.setFanSpeedCommand}"(fanSpeed)
-    return [
-        (fanSpeedTrait.currentSpeedAttribute): fanSpeed
-    ]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private executeCommand_SetHumidity(deviceInfo, command) {
-    checkMfa(deviceInfo.deviceType, "Set Humidity", command)
-    def humiditySettingTrait = deviceInfo.deviceType.traits.HumiditySetting
-    def humiditySetpoint = command.params.humidity
-
-    deviceInfo.device."${humiditySettingTrait.setHumidityCommand}"(humiditySetpoint)
-    return [
-        (humiditySettingTrait.humiditySetpointAttribute): humiditySetpoint
-    ]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private executeCommand_SetTemperature(deviceInfo, command) {
-    checkMfa(deviceInfo.deviceTrait, "Set Temperature", command)
-    def temperatureControlTrait = deviceInfo.deviceType.traits.TemperatureControl
-    def setpoint = command.params.temperature
-    if (temperatureControlTrait.temperatureUnit == "F") {
-        setpoint = celsiusToFahrenheitRounded(setpoint)
-    }
-    deviceInfo.device."${temperatureControlTrait.setTemperatureCommand}"(setpoint)
-
-    return [
-        (temperatureControlTrait.setpointAttribute): setpoint
-    ]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private executeCommand_SetToggles(deviceInfo, command) {
-    def togglesTrait = deviceInfo.deviceType.traits.Toggles
-    def togglesToSet = command.params.updateToggleSettings
-
-    def statesToCheck = [:]
-    togglesToSet.each { toggleName, toggleValue ->
-        def toggle = togglesTrait.toggles.find { it.name == toggleName }
-        def fakeDeviceInfo = [
-            deviceType: [
-                traits: [
-                    // We're delegating to the OnOff handler, so we need
-                    // to fake the OnOff trait.
-                    OnOff: toggle
-                ]
-            ],
-            device: deviceInfo.device
-        ]
-        checkMfa(deviceInfo.deviceType, "${toggle.labels[0]} ${toggleValue ? "On" : "Off"}", command)
-        statesToCheck << executeCommand_OnOff(fakeDeviceInfo, [params: [on: toggleValue]])
-    }
-    return statesToCheck
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private executeCommand_setVolume(deviceInfo, command) {
-    checkMfa(deviceInfo.deviceType, "Set Volume", command)
-    def volumeTrait = deviceInfo.deviceType.traits.Volume
-    def volumeLevel = command.params.volumeLevel
-    deviceInfo.device."${volumeTrait.setVolumeCommand}"(volumeLevel)
-
-    return [
-        (volumeTrait.volumeAttribute): volumeLevel
-    ]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private executeCommand_ThermostatTemperatureSetpoint(deviceInfo, command) {
-    checkMfa(deviceInfo.deviceType, "Set Setpoint", command)
-    def temperatureSettingTrait = deviceInfo.deviceType.traits.TemperatureSetting
-    def setpoint = command.params.thermostatTemperatureSetpoint
-    if (temperatureSettingTrait.temperatureUnit == "F") {
-        setpoint = celsiusToFahrenheitRounded(setpoint)
-    }
-
-    def hubitatMode = deviceInfo.device.currentValue(temperatureSettingTrait.currentModeAttribute)
-    def googleMode = temperatureSettingTrait.hubitatToGoogleModeMap[hubitatMode]
-    def setSetpointCommand = temperatureSettingTrait.modeSetSetpointCommands[googleMode]
-    deviceInfo.device."${setSetpointCommand}"(setpoint)
-
-    return [
-        (temperatureSettingTrait.modeSetpointAttributes[googleMode]): setpoint
-    ]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private executeCommand_ThermostatTemperatureSetRange(deviceInfo, command) {
-    checkMfa(deviceInfo.deviceType, "Set Setpoint", command)
-    def temperatureSettingTrait = deviceInfo.deviceType.traits.TemperatureSetting
-    def coolSetpoint = command.params.thermostatTemperatureSetpointHigh
-    def heatSetpoint = command.params.thermostatTemperatureSetpointLow
-    if (temperatureSettingTrait.temperatureUnit == "F") {
-        coolSetpoint = celsiusToFahrenheitRounded(coolSetpoint)
-        heatSetpoint = celsiusToFahrenheitRounded(heatSetpoint)
-    }
-    def setRangeCommands = temperatureSettingTrait.modeSetSetpointCommands["heatcool"]
-    deviceInfo.device."${setRangeCommands.setCoolingSetpointCommand}"(coolSetpoint)
-    deviceInfo.device."${setRangeCommands.setHeatingSetpointCommand}"(heatSetpoint)
-
-    def setRangeAttributes = temperatureSettingTrait.modeSetpointAttributes["heatcool"]
-    return [
-        (setRangeAttributes.coolingSetpointAttribute): coolSetpoint,
-        (setRangeAttributes.heatingSetpointAttribute): heatSetpoint
-    ]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private executeCommand_ThermostatSetMode(deviceInfo, command) {
-    checkMfa(deviceInfo.deviceType, "Set Mode", command)
-    def temperatureSettingTrait = deviceInfo.deviceType.traits.TemperatureSetting
-    def googleMode = command.params.thermostatMode
-    def hubitatMode = temperatureSettingTrait.googleToHubitatModeMap[googleMode]
-    deviceInfo.device."${temperatureSettingTrait.setModeCommand}"(hubitatMode)
-
-    return [
-        (temperatureSettingTrait.currentModeAttribute): hubitatMode
-    ]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private executeCommand_volumeRelative(deviceInfo, command) {
-    checkMfa(deviceInfo.deviceType, "Set Volume", command)
-    def volumeTrait = deviceInfo.deviceType.traits.Volume
-    def volumeChange = command.params.relativeSteps
-    def device = deviceInfo.device
-
-    def currentVolume = device.currentValue(volumeTrait.volumeAttribute)
-    // volumeChange will be negative when decreasing volume
-    def newVolume = currentVolume + volumeChange
-    device."${volumeTrait.setVolumeCommand}"(newVolume)
-
-    return [
-        (volumeTrait.volumeAttribute): newVolume
-    ]
-}
-
-private handleQueryRequest(request) {
-    def resp = [
-        requestId: request.JSON.requestId,
-        payload: [
-            devices: [:]
-        ]
-    ]
-    def requestedDevices = request.JSON.inputs[0].payload.devices
-    def knownDevices = allKnownDevices()
-
-    requestedDevices.each { requestedDevice ->
-        def deviceInfo = knownDevices."${requestedDevice.id}"
-        def deviceState = [:]
-        if (deviceInfo != null) {
-            deviceInfo.deviceType.traits.each { traitType, deviceTrait ->
-                deviceState += "deviceStateForTrait_${traitType}"(deviceTrait, deviceInfo.device)
-            }
-        } else {
-            LOGGER.warn("Requested device ${requestedDevice.name} not found.")
-        }
-        resp.payload.devices."${requestedDevice.id}" = deviceState
-    }
-    LOGGER.debug(resp)
-    return resp
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private deviceStateForTrait_Brightness(deviceTrait, device) {
-    return [
-        brightness: device.currentValue(deviceTrait.brightnessAttribute)
-    ]
-}
-
-@SuppressWarnings(['UnusedPrivateMethod', 'UnusedPrivateMethodParameter'])
-private deviceStateForTrait_CameraStream(deviceTrait, device) {
-    return [
-        cameraStreamAccessUrl: device.currentValue(deviceTrait.cameraStreamAttribute),
-        cameraStreamReceiverAppId: null,
-        cameraStreamAuthToken: null
-    ]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private deviceStateForTrait_ColorSetting(deviceTrait, device) {
-    def colorMode
-    if (deviceTrait.fullSpectrum && deviceTrait.colorTemperature) {
-        if (device.currentValue(deviceTrait.colorModeAttribute) == deviceTrait.fullSpectrumModeValue) {
-            colorMode = "spectrum"
-        } else {
-            colorMode = "temperature"
-        }
-    } else if (deviceTrait.fullSpectrum) {
-        colorMode = "spectrum"
-    } else {
-        colorMode = "temperature"
-    }
-
-    def deviceState = [
-        color: [:]
-    ]
-
-    if (colorMode == "spectrum") {
-        def hue = device.currentValue(deviceTrait.hueAttribute)
-        def saturation = device.currentValue(deviceTrait.saturationAttribute)
-        def value = device.currentValue(deviceTrait.levelAttribute)
-
-        // Hubitat reports hue in the range 0...100, but Google wants it in degrees (0...360)
-        hue = hue * 360 / 100
-        // Hubitat reports saturation and value in the range 0...100 but
-        // Google wants them as floats in the range 0...1
-        saturation = saturation / 100
-        value = value / 100
-
-        deviceState.color = [
-            spectrumHsv: [
-                hue: hue,
-                saturation: saturation,
-                value: value
-            ]
-        ]
-    } else {
-        deviceState.color = [
-            temperatureK: device.currentValue(deviceTrait.colorTemperatureAttribute)
-        ]
-    }
-
-    return deviceState
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private deviceStateForTrait_FanSpeed(deviceTrait, device) {
-    def currentSpeed = device.currentValue(deviceTrait.currentSpeedAttribute)
-
-    return [
-        currentFanSpeedSetting: currentSpeed
-    ]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private deviceStateForTrait_HumiditySetting(deviceTrait, device) {
-    def deviceState = [
-        humidityAmbientPercent: Math.round(device.currentValue(deviceTrait.humidityAttribute))
-    ]
-    if (!deviceTrait.queryOnly) {
-        deviceState.humiditySetpointPercent = Math.round(device.currentValue(deviceTrait.humiditySetpointAttribute))
-    }
-    return deviceState
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private deviceStateForTrait_LockUnlock(deviceTrait, device) {
-    def isLocked = device.currentValue(deviceTrait.lockedUnlockedAttribute) == deviceTrait.lockedValue
-    return [
-        isLocked: isLocked,
-        isJammed: false
-    ]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private deviceStateForTrait_OnOff(deviceTrait, device) {
-    def isOn
-    if (deviceTrait.onValue) {
-        isOn = device.currentValue(deviceTrait.onOffAttribute) == deviceTrait.onValue
-    } else {
-        isOn = device.currentValue(deviceTrait.onOffAttribute) != deviceTrait.offValue
-    }
-    return [
-        on: isOn
-    ]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private deviceStateForTrait_OpenClose(deviceTrait, device) {
-    def openPercent
-    if (deviceTrait.discreteOnlyOpenClose) {
-        def openValues = deviceTrait.openValue.split(",")
-        if (device.currentValue(deviceTrait.openCloseAttribute) in openValues) {
-            openPercent = 100
-        } else {
-            openPercent = 0
-        }
-    } else {
-        openPercent = device.currentValue(deviceTrait.openCloseAttribute)
-    }
-    return [
-        openPercent: openPercent
-    ]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private deviceStateForTrait_Rotation(deviceTrait, device) {
-    return [
-        rotationPercent: device.currentValue(deviceTrait.rotationAttribute)
-    ]
-}
-
-@SuppressWarnings(['UnusedPrivateMethod', 'UnusedPrivateMethodParameter'])
-private deviceStateForTrait_Scene(deviceTrait, device) {
-    return [:]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private deviceStateForTrait_TemperatureControl(deviceTrait, device) {
-    def currentTemperature = device.currentValue(deviceTrait.currentTemperatureAttribute)
-    if (deviceTrait.temperatureUnit == "F") {
-        currentTemperature = fahrenheitToCelsiusRounded(currentTemperature)
-    }
-    def state = [
-        temperatureAmbientCelsius: currentTemperature
-    ]
-
-    if (deviceTrait.queryOnly) {
-        state.temperatureSetpointCelsius = currentTemperature
-    } else {
-        def setpoint = device.currentValue(deviceTrait.setpointAttribute)
-        if (deviceTrait.temperatureUnit == "F") {
-            setpoint = fahrenheitToCelsiusRounded(setpoint)
-        }
-        state.temperatureSetpiontCelsius = setpoint
-    }
-
-    return state
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private deviceStateForTrait_TemperatureSetting(deviceTrait, device) {
-    def state = [:]
-
-    def currentTemperature = device.currentValue(deviceTrait.currentTemperatureAttribute)
-    if (deviceTrait.temperatureUnit == "F") {
-        currentTemperature = fahrenheitToCelsiusRounded(currentTemperature)
-    }
-    state.thermostatTemperatureAmbient = currentTemperature
-
-    if (deviceTrait.queryOnly) {
-        state.thermostatMode = "on"
-        state.thermostatTemperatureSetpoint = currentTemperature
-    } else {
-        def hubitatMode = device.currentValue(deviceTrait.currentModeAttribute)
-        def googleMode = deviceTrait.hubitatToGoogleModeMap[hubitatMode]
-        state.thermostatMode = googleMode
-
-        if (googleMode == "heatcool") {
-            def heatingSetpointAttr = deviceTrait.modeSetpointAttributes[googleMode].heatingSetpointAttribute
-            def coolingSetpointAttr = deviceTrait.modeSetpointAttributes[googleMode].coolingSetpointAttribute
-            def heatSetpoint = device.currentValue(heatingSetpointAttr)
-            def coolSetpoint = device.currentValue(coolingSetpointAttr)
-            if (deviceTrait.temperatureUnit == "F") {
-                heatSetpoint = fahrenheitToCelsiusRounded(heatSetpoint)
-                coolSetpoint = fahrenheitToCelsiusRounded(coolSetpoint)
-            }
-            state.thermostatTemperatureSetpointHigh = coolSetpoint
-            state.thermostatTemperatureSetpointLow = heatSetpoint
-        } else {
-            def setpointAttr = deviceTrait.modeSetpointAttributes[googleMode]
-            if (setpointAttr) {
-                def setpoint = device.currentValue(setpointAttr)
-                if (deviceTrait.temperatureUnit == "F") {
-                    setpoint = fahrenheitToCelsiusRounded(setpoint)
-                }
-                state.thermostatTemperatureSetpoint = setpoint
-            }
-        }
-    }
-    return state
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private deviceStateForTrait_Toggles(deviceTrait, device) {
-    return [
-        currentToggleSettings: deviceTrait.toggles.collectEntries { toggle ->
-            [toggle.name, deviceStateForTrait_OnOff(toggle, device).on]
-        }
-    ]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private deviceStateForTrait_Volume(deviceTrait, device) {
-    def deviceState = [
-        currentVolume: device.currentValue(deviceTrait.volumeAttribute)
-    ]
-    if (deviceTrait.canMuteUnmute) {
-        deviceState.isMuted = device.currentValue(deviceTrait.muteAttribute) == deviceTrait.mutedValue
-    }
-    return deviceState
-}
-
-private handleSyncRequest(request) {
-    def resp = [
-        requestId: request.JSON.requestId,
-        payload: [
-            devices: []
-        ]
-    ]
-
-    (deviceTypes() + [modeSceneDeviceType()]).each { deviceType ->
-        def traits = deviceType.traits.collect { traitType, deviceTrait ->
-            "action.devices.traits.${traitType}"
-        }
-        def attributes = [:]
-        deviceType.traits.each { traitType, deviceTrait ->
-            attributes += "attributesForTrait_${traitType}"(deviceTrait)
-        }
-        deviceType.devices.each { device ->
-            resp.payload.devices << [
-                id: device.id,
-                type: "action.devices.types.${deviceType.googleDeviceType}",
-                traits: traits,
-                name: [
-                    defaultNames: [device.name],
-                    name: device.label ?: device.name
-                ],
-                willReportState: false,
-                attributes: attributes,
-            ]
-        }
-    }
-
-    LOGGER.debug(resp)
-    return resp
-}
-
-@SuppressWarnings(['UnusedPrivateMethod', 'UnusedPrivateMethodParameter'])
-private attributesForTrait_Brightness(deviceTrait) {
-    return [:]
-}
-
-@SuppressWarnings(['UnusedPrivateMethod', 'UnusedPrivateMethodParameter'])
-private attributesForTrait_CameraStream(deviceTrait) {
-    return [
-        cameraStreamSupportedProtocols: ["progressive_mp4", "hls", "dash", "smooth_stream"],
-        cameraStreamNeedAuthToken:      false,
-        cameraStreamNeedDrmEncryption:  false
-    ]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private attributesForTrait_ColorSetting(deviceTrait) {
-    def colorAttrs = [:]
-    if (deviceTrait.fullSpectrum) {
-        colorAttrs << [
-            colorModel: "hsv"
-        ]
-    }
-    if (deviceTrait.colorTemperature) {
-        colorAttrs << [
-            colorTemperatureRange: [
-                temperatureMinK: deviceTrait.colorTemperatureMin,
-                temperatureMaxK: deviceTrait.colorTemperatureMax
-            ]
-        ]
-    }
-    return colorAttrs
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private attributesForTrait_FanSpeed(deviceTrait) {
-    def fanSpeedAttrs = [
-        availableFanSpeeds: [
-            speeds: deviceTrait.fanSpeeds.collect { hubitatLevelName, googleLevelNames ->
-                def speeds = googleLevelNames.split(",")
-                [
-                    speed_name: hubitatLevelName,
-                    speed_values: [
-                        [
-                            speed_synonym: speeds,
-                            lang: "en"
-                        ]
-                    ]
-                ]
-            },
-            ordered: true
-        ],
-        reversible: deviceTrait.reversible
-    ]
-    return fanSpeedAttrs
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private attributesForTrait_HumiditySetting(deviceTrait) {
-    def attrs = [
-        queryOnlyHumiditySetting: deviceTrait.queryOnly
-    ]
-    if (deviceTrait.humidityRange) {
-        attrs.humiditySetpointRange = [
-            minPercent: deviceTrait.humidityRange.min,
-            maxPercent: deviceTrait.humidityRange.max
-        ]
-    }
-    return attrs
-}
-
-@SuppressWarnings(['UnusedPrivateMethod', 'UnusedPrivateMethodParameter'])
-private attributesForTrait_LockUnlock(deviceTrait) {
-    return [:]
-}
-
-@SuppressWarnings(['UnusedPrivateMethod', 'UnusedPrivateMethodParameter'])
-private attributesForTrait_OnOff(deviceTrait) {
-    return [:]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private attributesForTrait_OpenClose(deviceTrait) {
-    return [
-        discreteOnlyOpenClose: deviceTrait.discreteOnlyOpenClose,
-        queryOnlyOpenClose: deviceTrait.queryOnly
-    ]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private attributesForTrait_Rotation(deviceTrait) {
-    return [
-        supportsContinuousRotation: deviceTrait.continuousRotation,
-        supportsPercent:            true,
-        supportsDegrees:            false
-    ]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private attributesForTrait_Scene(deviceTrait) {
-    return [
-        sceneReversible: deviceTrait.sceneReversible
-    ]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private attributesForTrait_TemperatureControl(deviceTrait) {
-    def attrs = [
-        temperatureUnitForUX:        deviceTrait.temperatureUnit,
-        queryOnlyTemperatureControl: deviceTrait.queryOnly
-    ]
-
-    if (!deviceTrait.queryOnly) {
-        if (deviceTrait.temperatureUnit == "C") {
-            attrs.temperatureRange = [
-                minThresholdCelsius: deviceTrait.minTemperature,
-                maxThresholdCelsius: deviceTrait.maxTemperature
-            ]
-        } else {
-            attrs.temperatureRange = [
-                minThresholdCelsius: fahrenheitToCelsiusRounded(deviceTrait.minTemperature),
-                maxThresholdCelsius: fahrenheitToCelsiusRounded(deviceTrait.maxTemperature)
-            ]
-        }
-
-        if (deviceTrait.temperatureStep) {
-            if (deviceTrait.temperatureUnit == "C") {
-                attrs.temperatureStepCelsius = deviceTrait.temperatureStep
-            } else {
-                // 5/9 is the scale factor for converting from F to C
-                attrs.temperatureStepCelsius = deviceTrait.temperatureStep * (5 / 9)
-            }
-        }
-    }
-
-    return attrs
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
 private attributesForTrait_TemperatureSetting(deviceTrait) {
     def attrs = [
         thermostatTemperatureUnit:   deviceTrait.temperatureUnit,
@@ -2235,247 +2288,6 @@ private attributesForTrait_TemperatureSetting(deviceTrait) {
         }
     }
     return attrs
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private attributesForTrait_Toggles(deviceTrait) {
-    return [
-        availableToggles: deviceTrait.toggles.collect { toggle ->
-            [
-                name: toggle.name,
-                name_values: [
-                    [
-                        name_synonym: toggle.labels,
-                        lang: "en"
-                    ]
-                ]
-            ]
-        }
-    ]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private attributesForTrait_Volume(deviceTrait) {
-    return [
-        volumeMaxLevel:         100,
-        volumeCanMuteAndUnmute: deviceTrait.canMuteUnmute,
-        levelStepSize:          deviceTrait.volumeStep
-    ]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private traitFromSettings_Brightness(traitName) {
-    return [
-        brightnessAttribute:  settings."${traitName}.brightnessAttribute",
-        setBrightnessCommand: settings."${traitName}.setBrightnessCommand",
-        commands:             ["Set Brightness"]
-    ]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private traitFromSettings_CameraStream(traitName) {
-    return [
-        cameraStreamAttribute: settings."${traitName}.cameraStreamAttribute",
-        commands:              []
-    ]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private traitFromSettings_ColorSetting(traitName) {
-    def deviceTrait = [
-        fullSpectrum:     settings."${traitName}.fullSpectrum",
-        colorTemperature: settings."${traitName}.colorTemperature",
-        commands:         ["Set Color"]
-    ]
-
-    if (deviceTrait.fullSpectrum) {
-        deviceTrait << [
-            hueAttribute:        settings."${traitName}.hueAttribute",
-            saturationAttribute: settings."${traitName}.saturationAttribute",
-            levelAttribute:      settings."${traitName}.levelAttribute",
-            setColorCommand:     settings."${traitName}.setColorCommand"
-        ]
-    }
-    if (deviceTrait.colorTemperature) {
-        deviceTrait << [
-            colorTemperatureMin:        settings."${traitName}.colorTemperature.min",
-            colorTemperatureMax:        settings."${traitName}.colorTemperature.max",
-            colorTemperatureAttribute:  settings."${traitName}.colorTemperatureAttribute",
-            setColorTemperatureCommand: settings."${traitName}.setColorTemperatureCommand"
-        ]
-    }
-    if (deviceTrait.fullSpectrum && deviceTrait.colorTemperature) {
-        deviceTrait << [
-            colorModeAttribute:    settings."${traitName}.colorModeAttribute",
-            fullSpectrumModeValue: settings."${traitName}.fullSpectrumModeValue",
-            temperatureModeValue:  settings."${traitName}.temperatureModeValue"
-        ]
-    }
-
-    return deviceTrait
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private traitFromSettings_FanSpeed(traitName) {
-    def fanSpeedMapping = [
-        currentSpeedAttribute: settings."${traitName}.currentSpeedAttribute",
-        setFanSpeedCommand:    settings."${traitName}.setFanSpeedCommand",
-        fanSpeeds:             [:],
-        reversible:            settings."${traitName}.reversible",
-        commands:              ["Set Fan Speed"]
-    ]
-    if (fanSpeedMapping.reversible) {
-        fanSpeedMapping.reverseCommand = settings."${traitName}.reverseCommand"
-        fanSpeedMapping.commands << "Reverse"
-    }
-    settings."${traitName}.fanSpeeds"?.each { fanSpeed ->
-        fanSpeedMapping.fanSpeeds[fanSpeed] = settings."${traitName}.speed.${fanSpeed}.googleNames"
-    }
-
-    return fanSpeedMapping
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private traitFromSettings_HumiditySetting(traitName) {
-    def humidityTrait = [
-        humidityAttribute: settings."${traitName}.humidityAttribute",
-        queryOnly:         settings."${traitName}.queryOnly",
-        commands:          []
-    ]
-    if (!humidityTrait.queryOnly) {
-        humidityTrait << [
-            humiditySetpointAttribute: settings."${traitName}.humiditySetpointAttribute",
-            setHumidityCommand:        settings."${traitName}.setHumidityCommand"
-        ]
-        humidityTrait.commands << "Set Humidity"
-
-        def humidityRange = [
-            min: settings."${traitName}.humidityRange.min",
-            max: settings."${traitName}.humidityRange.max"
-        ]
-        if (humidityRange.min != null || humidityRange.max != null) {
-            humidityTrait << [
-                humidityRange: humidityRange
-            ]
-        }
-    }
-    return humidityTrait
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private traitFromSettings_LockUnlock(traitName) {
-    return [
-        lockedUnlockedAttribute: settings."${traitName}.lockedUnlockedAttribute",
-        lockedValue:             settings."${traitName}.lockedValue",
-        lockCommand:             settings."${traitName}.lockCommand",
-        unlockCommand:           settings."${traitName}.unlockCommand",
-        commands:                ["Lock", "Unlock"]
-    ]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private traitFromSettings_OnOff(traitName) {
-    def deviceTrait = [
-        onOffAttribute: settings."${traitName}.onOffAttribute",
-        onValue:        settings."${traitName}.onValue",
-        offValue:       settings."${traitName}.offValue",
-        controlType:    settings."${traitName}.controlType",
-        commands:       ["On", "Off"]
-    ]
-
-    if (deviceTrait.controlType == "single") {
-        deviceTrait.onOffCommand = settings."${traitName}.onOffCommand"
-        deviceTrait.onParam = settings."${traitName}.onParameter"
-        deviceTrait.offParam = settings."${traitName}.offParameter"
-    } else {
-        deviceTrait.onCommand = settings."${traitName}.onCommand"
-        deviceTrait.offCommand = settings."${traitName}.offCommand"
-    }
-    return deviceTrait
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private traitFromSettings_OpenClose(traitName) {
-    def openCloseTrait = [
-        discreteOnlyOpenClose: settings."${traitName}.discreteOnlyOpenClose",
-        openCloseAttribute:    settings."${traitName}.openCloseAttribute",
-        // queryOnly may be null for device traits defined with older versions,
-        // so coerce it to a boolean
-        queryOnly:             settings."${traitName}.queryOnly" as boolean,
-        commands:              []
-    ]
-    if (openCloseTrait.discreteOnlyOpenClose) {
-        openCloseTrait.openValue = settings."${traitName}.openValue"
-        openCloseTrait.closedValue = settings."${traitName}.closedValue"
-    }
-
-    if (!openCloseTrait.queryOnly) {
-        if (openCloseTrait.discreteOnlyOpenClose) {
-            openCloseTrait.openCommand = settings."${traitName}.openCommand"
-            openCloseTrait.closeCommand = settings."${traitName}.closeCommand"
-            openCloseTrait.commands += ["Open", "Close"]
-        } else {
-            openCloseTrait.openPositionCommand = settings."${traitName}.openPositionCommand"
-            openCloseTrait.commands << "Set Position"
-        }
-    }
-
-    return openCloseTrait
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private traitFromSettings_Rotation(traitName) {
-    return [
-        rotationAttribute:  settings."${traitName}.rotationAttribute",
-        setRotationCommand: settings."${traitName}.setRotationCommand",
-        continuousRotation: settings."${traitName}.continuousRotation",
-        commands:        ["Rotate"]
-    ]
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private traitFromSettings_Scene(traitName) {
-    def sceneTrait = [
-        activateCommand: settings."${traitName}.activateCommand",
-        sceneReversible: settings."${traitName}.sceneReversible",
-        commands:        ["Activate Scene"]
-    ]
-    if (sceneTrait.sceneReversible) {
-        sceneTrait.deactivateCommand = settings."${traitName}.deactivateCommand"
-        sceneTrait.commands << "Deactivate Scene"
-    }
-    return sceneTrait
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private traitFromSettings_TemperatureControl(traitName) {
-    def tempControlTrait = [
-        temperatureUnit:             settings."${traitName}.temperatureUnit",
-        currentTemperatureAttribute: settings."${traitName}.currentTemperatureAttribute",
-        queryOnly:                   settings."${traitName}.queryOnly",
-        commands:                    []
-    ]
-
-    if (!tempControlTrait.queryOnly) {
-        tempControlTrait << [
-            currentSetpointAttribute: settings."${traitName}.setpointAttribute",
-            setTemperatureCommand:    settings."${traitName}.setTemperatureCommand",
-            // Min and Max temperature used the wrong input type originally, so coerce them
-            // from String to BigDecimal if this trait was saved with a broken version
-            minTemperature:           settings."${traitName}.minTemperature" as BigDecimal,
-            maxTemperature:           settings."${traitName}.maxTemperature" as BigDecimal
-        ]
-        tempControlTrait.commands << "Set Temperature"
-
-        def temperatureStep = settings."${traitName}.temperatureStep"
-        if (temperatureStep) {
-            // Temperature step used the wrong input type originally, so coerce them
-            // from String to BigDecimal if this trait was saved with a broken version
-            tempControlTrait.temperatureStep = temperatureStep as BigDecimal
-        }
-    }
-
-    return tempControlTrait
 }
 
 private thermostatSetpointAttributeForMode(traitName, mode) {
@@ -2570,30 +2382,209 @@ private traitFromSettings_TemperatureSetting(traitName) {
 }
 
 @SuppressWarnings('UnusedPrivateMethod')
-private traitFromSettings_Toggles(traitName) {
-    def togglesTrait = [
-        toggles:  [],
-        commands: [],
-    ]
-    def toggles = settings."${traitName}.toggles"?.collect { toggle ->
-        def toggleAttrs = [
-            name: toggle,
-            traitName: traitName,
-            labels: settings."${toggle}.labels"?.split(",")
-        ]
-        toggleAttrs << traitFromSettings_OnOff(toggle)
-        toggleAttrs
-    }
-    if (toggles) {
-        togglesTrait.toggles = toggles
-        toggles.each { toggle ->
-            togglesTrait.commands += [
-                "${toggle.labels[0]} On" as String,
-                "${toggle.labels[0]} Off" as String
-            ]
+private deleteDeviceTrait_TemperatureSetting(deviceTrait) {
+    app.removeSetting("${deviceTrait.name}.temperatureUnit")
+    app.removeSetting("${deviceTrait.name}.currentTemperatureAttribute")
+    app.removeSetting("${deviceTrait.name}.queryOnly")
+    app.removeSetting("${deviceTrait.name}.modes")
+    app.removeSetting("${deviceTrait.name}.heatcoolBuffer")
+    app.removeSetting("${deviceTrait.name}.range.min")
+    app.removeSetting("${deviceTrait.name}.range.max")
+    app.removeSetting("${deviceTrait.name}.setModeCommand")
+    app.removeSetting("${deviceTrait.name}.currentModeAttribute")
+    GOOGLE_THERMOSTAT_MODES.each { mode, display ->
+        app.removeSetting("${deviceTrait.name}.mode.${mode}.hubitatMode")
+        def attrPrefName = THERMOSTAT_MODE_SETPOINT_ATTRIBUTE_PREFERENCES[mode]?.name
+        if (attrPrefName) {
+            app.removeSetting("${deviceTrait.name}.${attrPrefName}")
+        }
+        def commandPrefName = THERMOSTAT_MODE_SETPOINT_COMMAND_PREFERENCES[mode]?.name
+        if (commandPrefName) {
+            app.removeSetting("${deviceTrait.name}.${commandPrefName}")
         }
     }
-    return togglesTrait
+    // These settings are no longer set for new device types, but may still exist
+    // for device types created with older versions of the app
+    app.removeSetting("${deviceTrait.name}.setpointAttribute")
+    app.removeSetting("${deviceTrait.name}.setSetpointCommand")
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private deviceStateForTrait_TemperatureSetting(deviceTrait, device) {
+    def state = [:]
+
+    def currentTemperature = device.currentValue(deviceTrait.currentTemperatureAttribute)
+    if (deviceTrait.temperatureUnit == "F") {
+        currentTemperature = fahrenheitToCelsiusRounded(currentTemperature)
+    }
+    state.thermostatTemperatureAmbient = currentTemperature
+
+    if (deviceTrait.queryOnly) {
+        state.thermostatMode = "on"
+        state.thermostatTemperatureSetpoint = currentTemperature
+    } else {
+        def hubitatMode = device.currentValue(deviceTrait.currentModeAttribute)
+        def googleMode = deviceTrait.hubitatToGoogleModeMap[hubitatMode]
+        state.thermostatMode = googleMode
+
+        if (googleMode == "heatcool") {
+            def heatingSetpointAttr = deviceTrait.modeSetpointAttributes[googleMode].heatingSetpointAttribute
+            def coolingSetpointAttr = deviceTrait.modeSetpointAttributes[googleMode].coolingSetpointAttribute
+            def heatSetpoint = device.currentValue(heatingSetpointAttr)
+            def coolSetpoint = device.currentValue(coolingSetpointAttr)
+            if (deviceTrait.temperatureUnit == "F") {
+                heatSetpoint = fahrenheitToCelsiusRounded(heatSetpoint)
+                coolSetpoint = fahrenheitToCelsiusRounded(coolSetpoint)
+            }
+            state.thermostatTemperatureSetpointHigh = coolSetpoint
+            state.thermostatTemperatureSetpointLow = heatSetpoint
+        } else {
+            def setpointAttr = deviceTrait.modeSetpointAttributes[googleMode]
+            if (setpointAttr) {
+                def setpoint = device.currentValue(setpointAttr)
+                if (deviceTrait.temperatureUnit == "F") {
+                    setpoint = fahrenheitToCelsiusRounded(setpoint)
+                }
+                state.thermostatTemperatureSetpoint = setpoint
+            }
+        }
+    }
+    return state
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private executeCommand_ThermostatTemperatureSetpoint(deviceInfo, command) {
+    checkMfa(deviceInfo.deviceType, "Set Setpoint", command)
+    def temperatureSettingTrait = deviceInfo.deviceType.traits.TemperatureSetting
+    def setpoint = command.params.thermostatTemperatureSetpoint
+    if (temperatureSettingTrait.temperatureUnit == "F") {
+        setpoint = celsiusToFahrenheitRounded(setpoint)
+    }
+
+    def hubitatMode = deviceInfo.device.currentValue(temperatureSettingTrait.currentModeAttribute)
+    def googleMode = temperatureSettingTrait.hubitatToGoogleModeMap[hubitatMode]
+    def setSetpointCommand = temperatureSettingTrait.modeSetSetpointCommands[googleMode]
+    deviceInfo.device."${setSetpointCommand}"(setpoint)
+
+    return [
+        thermostatTemperatureSetpoint: setpoint
+    ]
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private executeCommand_ThermostatTemperatureSetRange(deviceInfo, command) {
+    checkMfa(deviceInfo.deviceType, "Set Setpoint", command)
+    def temperatureSettingTrait = deviceInfo.deviceType.traits.TemperatureSetting
+    def coolSetpoint = command.params.thermostatTemperatureSetpointHigh
+    def heatSetpoint = command.params.thermostatTemperatureSetpointLow
+    if (temperatureSettingTrait.temperatureUnit == "F") {
+        coolSetpoint = celsiusToFahrenheitRounded(coolSetpoint)
+        heatSetpoint = celsiusToFahrenheitRounded(heatSetpoint)
+    }
+    def setRangeCommands = temperatureSettingTrait.modeSetSetpointCommands["heatcool"]
+    deviceInfo.device."${setRangeCommands.setCoolingSetpointCommand}"(coolSetpoint)
+    deviceInfo.device."${setRangeCommands.setHeatingSetpointCommand}"(heatSetpoint)
+
+    def setRangeAttributes = temperatureSettingTrait.modeSetpointAttributes["heatcool"]
+    return [
+        thermostatTemperatureSetpointHigh: coolSetpoint,
+        thermostatTemperatureSetpointLow: heatSetpoint,
+		thermostatMode: "heatcool"
+    ]
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private executeCommand_ThermostatSetMode(deviceInfo, command) {
+    checkMfa(deviceInfo.deviceType, "Set Mode", command)
+    def temperatureSettingTrait = deviceInfo.deviceType.traits.TemperatureSetting
+    def googleMode = command.params.thermostatMode
+    def hubitatMode = temperatureSettingTrait.googleToHubitatModeMap[googleMode]
+    deviceInfo.device."${temperatureSettingTrait.setModeCommand}"(hubitatMode)
+
+    return [
+        thermostatMode: googleMode
+    ]
+}
+
+// Volume
+@SuppressWarnings('UnusedPrivateMethod')
+private deviceTraitPreferences_Volume(deviceTrait) {
+    section("Volume Preferences") {
+        input(
+            name: "${deviceTrait.name}.volumeAttribute",
+            title: "Current Volume Attribute",
+            type: "text",
+            required: true,
+            defaultValue: "volume"
+        )
+        input(
+            name: "${deviceTrait.name}.setVolumeCommand",
+            title: "Set Rotation Command",
+            type: "text",
+            required: true,
+            defaultValue: "setVolume"
+        )
+        input(
+            name: "${deviceTrait.name}.volumeStep",
+            title: "Volume Level Step",
+            type: "number",
+            required: true,
+            defaultValue: 1
+        )
+        input(
+            name: "${deviceTrait.name}.canMuteUnmute",
+            title: "Supports Mute And Unmute",
+            type: "bool",
+            defaultValue: true,
+            submitOnChange: true
+        )
+        if (deviceTrait.canMuteUnmute) {
+            input(
+                name: "${deviceTrait.name}.muteAttribute",
+                title: "Mute State Attribute",
+                type: "text",
+                required: true,
+                defaultValue: "mute"
+            )
+            input(
+                name: "${deviceTrait.name}.mutedValue",
+                title: "Muted Value",
+                type: "text",
+                required: true,
+                defaultValue: "muted"
+            )
+            input(
+                name: "${deviceTrait.name}.unmutedValue",
+                title: "Unmuted Value",
+                type: "text",
+                required: true,
+                defaultValue: "unmuted"
+            )
+            input(
+                name: "${deviceTrait.name}.muteCommand",
+                title: "Mute Command",
+                type: "text",
+                required: true,
+                defaultValue: "mute"
+            )
+            input(
+                name: "${deviceTrait.name}.unmuteCommand",
+                title: "Unmute Command",
+                type: "text",
+                required: true,
+                defaultValue: "unmute"
+            )
+        }
+    }
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private attributesForTrait_Volume(deviceTrait) {
+    return [
+        volumeMaxLevel:         100,
+        volumeCanMuteAndUnmute: deviceTrait.canMuteUnmute,
+        levelStepSize:          deviceTrait.volumeStep
+    ]
 }
 
 @SuppressWarnings('UnusedPrivateMethod')
@@ -2622,6 +2613,147 @@ private traitFromSettings_Volume(traitName) {
     }
 
     return volumeTrait
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private deleteDeviceTrait_Volume(deviceTrait) {
+    app.removeSetting("${deviceTrait.name}.volumeAttribute")
+    app.removeSetting("${deviceTrait.name}.setVolumeCommand")
+    app.removeSetting("${deviceTrait.name}.volumeStep")
+    app.removeSetting("${deviceTrait.name}.canMuteUnmute")
+    app.removeSetting("${deviceTrait.name}.muteAttribute")
+    app.removeSetting("${deviceTrait.name}.mutedValue")
+    app.removeSetting("${deviceTrait.name}.unmutedValue")
+    app.removeSetting("${deviceTrait.name}.muteCommand")
+    app.removeSetting("${deviceTrait.name}.unmuteCommand")
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private deviceStateForTrait_Volume(deviceTrait, device) {
+    def deviceState = [
+        currentVolume: device.currentValue(deviceTrait.volumeAttribute)
+    ]
+    if (deviceTrait.canMuteUnmute) {
+        deviceState.isMuted = device.currentValue(deviceTrait.muteAttribute) == deviceTrait.mutedValue
+    }
+    return deviceState
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private executeCommand_setVolume(deviceInfo, command) {
+    checkMfa(deviceInfo.deviceType, "Set Volume", command)
+    def volumeTrait = deviceInfo.deviceType.traits.Volume
+    def volumeLevel = command.params.volumeLevel
+    deviceInfo.device."${volumeTrait.setVolumeCommand}"(volumeLevel)
+    def resp = [
+        currentVolume: volumeLevel
+    ]
+    if (volumeTrait.canMuteUnmute) {
+        resp << [isMuted: false]
+    }
+    return resp
+}
+
+@SuppressWarnings('UnusedPrivateMethod')
+private executeCommand_mute(deviceInfo, command) {
+    def volumeTrait = deviceInfo.deviceType.traits.Volume
+    def checkValue
+    if (command.params.mute) {
+        checkMfa(deviceInfo.deviceType, "Mute", command)
+        deviceInfo.device."${volumeTrait.muteCommand}"()
+        checkValue = volumeTrait.mutedValue
+    } else {
+        checkMfa(deviceInfo.deviceType, "Unmute", command)
+        deviceInfo.device."${volumeTrait.unmuteCommand}"()
+        checkValue = volumeTrait.unmutedValue
+    }
+    return [
+        isMuted: command.params.mute as boolean
+    ]
+}
+
+
+@SuppressWarnings('UnusedPrivateMethod')
+private executeCommand_volumeRelative(deviceInfo, command) {
+    checkMfa(deviceInfo.deviceType, "Set Volume", command)
+    def volumeTrait = deviceInfo.deviceType.traits.Volume
+    def volumeChange = command.params.relativeSteps
+    def device = deviceInfo.device
+
+    def currentVolume = device.currentValue(volumeTrait.volumeAttribute)
+    // volumeChange will be negative when decreasing volume
+    def newVolume = currentVolume + volumeChange
+    device."${volumeTrait.setVolumeCommand}"(newVolume)
+    def resp = [
+        currentVolume: newVolume
+    ]
+    if (volumeTrait.canMuteUnmute) {
+        resp << [isMuted: false]
+    }
+    return resp
+}
+
+// END?
+
+private handleQueryRequest(request) {
+    def resp = [
+        requestId: request.JSON.requestId,
+        payload: [
+            devices: [:]
+        ]
+    ]
+    def requestedDevices = request.JSON.inputs[0].payload.devices
+    def knownDevices = allKnownDevices()
+
+    requestedDevices.each { requestedDevice ->
+        def deviceInfo = knownDevices."${requestedDevice.id}"
+        def deviceState = [:]
+        if (deviceInfo != null) {
+            deviceInfo.deviceType.traits.each { traitType, deviceTrait ->
+                deviceState += "deviceStateForTrait_${traitType}"(deviceTrait, deviceInfo.device)
+            }
+        } else {
+            LOGGER.warn("Requested device ${requestedDevice.name} not found.")
+        }
+        resp.payload.devices."${requestedDevice.id}" = deviceState
+    }
+    LOGGER.debug(resp)
+    return resp
+}
+
+private handleSyncRequest(request) {
+    def resp = [
+        requestId: request.JSON.requestId,
+        payload: [
+            devices: []
+        ]
+    ]
+
+    (deviceTypes() + [modeSceneDeviceType()]).each { deviceType ->
+        def traits = deviceType.traits.collect { traitType, deviceTrait ->
+            "action.devices.traits.${traitType}"
+        }
+        def attributes = [:]
+        deviceType.traits.each { traitType, deviceTrait ->
+            attributes += "attributesForTrait_${traitType}"(deviceTrait)
+        }
+        deviceType.devices.each { device ->
+            resp.payload.devices << [
+                id: device.id,
+                type: "action.devices.types.${deviceType.googleDeviceType}",
+                traits: traits,
+                name: [
+                    defaultNames: [device.name],
+                    name: device.label ?: device.name
+                ],
+                willReportState: false,
+                attributes: attributes,
+            ]
+        }
+    }
+
+    LOGGER.debug(resp)
+    return resp
 }
 
 private deviceTraitsFromState(deviceType) {
@@ -2655,173 +2787,6 @@ private deleteDeviceTrait(deviceTrait) {
     def deviceType = pieces[0]
     def traitType = pieces[1]
     deviceTraitsFromState(deviceType).remove(traitType as String)
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private deleteDeviceTrait_Brightness(deviceTrait) {
-    app.removeSetting("${deviceTrait.name}.brightnessAttribute")
-    app.removeSetting("${deviceTrait.name}.setBrightnessCommand")
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private deleteDeviceTrait_CameraStream(deviceTrait) {
-    app.removeSetting("${deviceTrait.name}.cameraStreamAttribute")
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private deleteDeviceTrait_ColorSetting(deviceTrait) {
-    app.removeSetting("${deviceTrait.name}.fullSpectrum")
-    app.removeSetting("${deviceTrait.name}.hueAttribute")
-    app.removeSetting("${deviceTrait.name}.saturationAttribute")
-    app.removeSetting("${deviceTrait.name}.levelAttribute")
-    app.removeSetting("${deviceTrait.name}.setColorCommand")
-    app.removeSetting("${deviceTrait.name}.colorTemperature")
-    app.removeSetting("${deviceTrait.name}.colorTemperature.min")
-    app.removeSetting("${deviceTrait.name}.colorTemperature.max")
-    app.removeSetting("${deviceTrait.name}.colorTemperatureAttribute")
-    app.removeSetting("${deviceTrait.name}.setColorTemperatureCommand")
-    app.removeSetting("${deviceTrait.name}.colorModeAttribute")
-    app.removeSetting("${deviceTrait.name}.fullSpectrumModeValue")
-    app.removeSetting("${deviceTrait.name}.temperatureModeValue")
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private deleteDeviceTrait_FanSpeed(deviceTrait) {
-    app.removeSetting("${deviceTrait.name}.currentSpeedAttribute")
-    app.removeSetting("${deviceTrait.name}.setFanSpeedCommand")
-    app.removeSetting("${deviceTrait.name}.reversible")
-    app.removeSetting("${deviceTrait.name}.reverseCommand")
-    deviceTrait.fanSpeeds.each { fanSpeed, googleNames ->
-        app.removeSetting("${deviceTrait.name}.speed.${fanSpeed}.googleNames")
-    }
-    app.removeSetting("${deviceTrait.name}.fanSpeeds")
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private deleteDeviceTrait_HumiditySetting(deviceTrait) {
-    app.removeSetting("${deviceTrait.name}.humidityAttribute")
-    app.removeSetting("${deviceTrait.name}.humiditySetpointAttribute")
-    app.removeSetting("${deviceTrait.name}.setHumidityCommand")
-    app.removeSetting("${deviceTrait.name}.humidityRange.min")
-    app.removeSetting("${deviceTrait.name}.humidityRange.max")
-    app.removeSetting("${deviceTrait.name}.queryOnly")
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private deleteDeviceTrait_LockUnlock(deviceTrait) {
-    app.removeSetting("${deviceTrait.name}.lockedUnlockedAttribute")
-    app.removeSetting("${deviceTrait.name}.lockedValue")
-    app.removeSetting("${deviceTrait.name}.lockCommand")
-    app.removeSetting("${deviceTrait.name}.unlockCommand")
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private deleteDeviceTrait_OnOff(deviceTrait) {
-    app.removeSetting("${deviceTrait.name}.onOffAttribute")
-    app.removeSetting("${deviceTrait.name}.onValue")
-    app.removeSetting("${deviceTrait.name}.offValue")
-    app.removeSetting("${deviceTrait.name}.controlType")
-    app.removeSetting("${deviceTrait.name}.onCommand")
-    app.removeSetting("${deviceTrait.name}.offCommand")
-    app.removeSetting("${deviceTrait.name}.onOffCommand")
-    app.removeSetting("${deviceTrait.name}.onParameter")
-    app.removeSetting("${deviceTrait.name}.offParameter")
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private deleteDeviceTrait_OpenClose(deviceTrait) {
-    app.removeSetting("${deviceTrait.name}.discreteOnlyOpenClose")
-    app.removeSetting("${deviceTrait.name}.openCloseAttribute")
-    app.removeSetting("${deviceTrait.name}.openValue")
-    app.removeSetting("${deviceTrait.name}.closedValue")
-    app.removeSetting("${deviceTrait.name}.openCommand")
-    app.removeSetting("${deviceTrait.name}.closeCommand")
-    app.removeSetting("${deviceTrait.name}.openPositionCommand")
-    app.removeSetting("${deviceTrait.name}.queryOnly")
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private deleteDeviceTrait_Rotation(deviceTrait) {
-    app.removeSetting("${deviceTrait.name}.rotationAttribute")
-    app.removeSetting("${deviceTrait.name}.setRotationCommand")
-    app.removeSetting("${deviceTrait.name}.continuousRotation")
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private deleteDeviceTrait_Scene(deviceTrait) {
-    app.removeSetting("${deviceTrait.name}.activateCommand")
-    app.removeSetting("${deviceTrait.name}.deactivateCommand")
-    app.removeSetting("${deviceTrait.name}.sceneReversible")
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private deleteDeviceTrait_TemperatureControl(deviceTrait) {
-    app.removeSetting("${deviceTrait.name}.temperatureUnit")
-    app.removeSetting("${deviceTrait.name}.currentTemperatureAttribute")
-    app.removeSetting("${deviceTrait.name}.queryOnly")
-    app.removeSetting("${deviceTrait.name}.setpointAttribute")
-    app.removeSetting("${deviceTrait.name}.setTemperatureCommand")
-    app.removeSetting("${deviceTrait.name}.minTemperature")
-    app.removeSetting("${deviceTrait.name}.maxTemperature")
-    app.removeSetting("${deviceTrait.name}.temperatureStep")
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private deleteDeviceTrait_TemperatureSetting(deviceTrait) {
-    app.removeSetting("${deviceTrait.name}.temperatureUnit")
-    app.removeSetting("${deviceTrait.name}.currentTemperatureAttribute")
-    app.removeSetting("${deviceTrait.name}.queryOnly")
-    app.removeSetting("${deviceTrait.name}.modes")
-    app.removeSetting("${deviceTrait.name}.heatcoolBuffer")
-    app.removeSetting("${deviceTrait.name}.range.min")
-    app.removeSetting("${deviceTrait.name}.range.max")
-    app.removeSetting("${deviceTrait.name}.setModeCommand")
-    app.removeSetting("${deviceTrait.name}.currentModeAttribute")
-    GOOGLE_THERMOSTAT_MODES.each { mode, display ->
-        app.removeSetting("${deviceTrait.name}.mode.${mode}.hubitatMode")
-        def attrPrefName = THERMOSTAT_MODE_SETPOINT_ATTRIBUTE_PREFERENCES[mode]?.name
-        if (attrPrefName) {
-            app.removeSetting("${deviceTrait.name}.${attrPrefName}")
-        }
-        def commandPrefName = THERMOSTAT_MODE_SETPOINT_COMMAND_PREFERENCES[mode]?.name
-        if (commandPrefName) {
-            app.removeSetting("${deviceTrait.name}.${commandPrefName}")
-        }
-    }
-    // These settings are no longer set for new device types, but may still exist
-    // for device types created with older versions of the app
-    app.removeSetting("${deviceTrait.name}.setpointAttribute")
-    app.removeSetting("${deviceTrait.name}.setSetpointCommand")
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private deleteDeviceTrait_Volume(deviceTrait) {
-    app.removeSetting("${deviceTrait.name}.volumeAttribute")
-    app.removeSetting("${deviceTrait.name}.setVolumeCommand")
-    app.removeSetting("${deviceTrait.name}.volumeStep")
-    app.removeSetting("${deviceTrait.name}.canMuteUnmute")
-    app.removeSetting("${deviceTrait.name}.muteAttribute")
-    app.removeSetting("${deviceTrait.name}.mutedValue")
-    app.removeSetting("${deviceTrait.name}.unmutedValue")
-    app.removeSetting("${deviceTrait.name}.muteCommand")
-    app.removeSetting("${deviceTrait.name}.unmuteCommand")
-}
-
-@SuppressWarnings('UnusedPrivateMethod')
-private deleteDeviceTrait_Toggles(deviceTrait) {
-    deviceTrait.toggles.each { toggle ->
-        deleteToggle(toggle)
-    }
-    app.removeSetting("${deviceTrait.name}.toggles")
-}
-
-private deleteToggle(toggle) {
-    LOGGER.debug("Deleting toggle: ${toggle}")
-    def toggles = settings."${toggle.traitName}.toggles"
-    toggles.remove(toggle.name)
-    app.updateSetting("${toggle.traitName}.toggles", toggles)
-    app.removeSetting("${toggle.name}.labels")
-    deleteDeviceTrait_OnOff(toggle)
 }
 
 private deviceTypeTraitsFromSettings(deviceTypeName) {
