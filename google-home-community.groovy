@@ -247,6 +247,12 @@ def deviceTypePreferences(deviceType) {
                 options: GOOGLE_DEVICE_TYPES,
                 required: true
             )
+            input(
+                name: "${devicePropertyName}.slowDevice",
+                title: "Slow Device - It can take some time for the device to complete commands, like a Grage Door when openeing or closing",
+                type: "bool",
+                defaultValue: false
+            )
         }
 
         def currentDeviceTraits = deviceType?.traits ?: [:]
@@ -1310,6 +1316,10 @@ private handleExecuteRequest(request) {
                     online: true
                 ]
             ]
+            // Is this a device that can take time to reach its new state
+            if (device.deviceType.slowDevice) {
+                result.status = "PENDING"
+            }
             // Populate with current states
             device.deviceType.traits.each { traitType, deviceTrait ->
                 result.states << "deviceStateForTrait_${traitType}"(deviceTrait, device.device)
