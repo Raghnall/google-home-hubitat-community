@@ -249,7 +249,7 @@ def deviceTypePreferences(deviceType) {
             )
             input(
                 name: "${devicePropertyName}.slowDevice",
-                title: "Slow Device - It can take some time for the device to complete commands, like a Grage Door when openeing or closing",
+                title: "Slow Devices - Devices assigned to this Device Type generally take longer to complete commands, such as: Grage Door Openers, Door Locks, or Blinds",
                 type: "bool",
                 defaultValue: false
             )
