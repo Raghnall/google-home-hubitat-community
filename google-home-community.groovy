@@ -350,6 +350,7 @@ def deviceTypeDelete(deviceType) {
         app.removeSetting("${deviceType.name}.devices")
         app.removeSetting("${deviceType.name}.confirmCommands")
         app.removeSetting("${deviceType.name}.secureCommands")
+		app.removeSetting("${deviceType.name}.slowDevice")
         def pinCodeIds = deviceType.pinCodes*.id
         pinCodeIds.each { pinCodeId -> deleteDeviceTypePin(deviceType, pinCodeId) }
         app.removeSetting("${deviceType.name}.pinCodes")
