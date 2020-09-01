@@ -1298,6 +1298,7 @@ def handleAction() {
 }
 
 private handleExecuteRequest(request) {
+    def startTime = new Date()
     def resp = [
         requestId: request.JSON.requestId,
         payload: [
@@ -1350,6 +1351,8 @@ private handleExecuteRequest(request) {
             resp.payload.commands << result
         }
     }
+    execTime = new Date()
+    LOGGER.debug("[requestId:" + resp.requestId + "] EXECUTE duration: " + (execTime.getTime() - startTime.getTime()))
     LOGGER.debug(resp)
     return resp
 }
@@ -1754,6 +1757,12 @@ private handleQueryRequest(request) {
             deviceInfo.deviceType.traits.each { traitType, deviceTrait ->
                 deviceState += "deviceStateForTrait_${traitType}"(deviceTrait, deviceInfo.device)
             }
+            // Always return with online set to true and status of "SUCCESS"
+            // This helps make sure devices do not show up as unreachable/offline in the Google Home App.
+            deviceState << [
+                online: true,
+                status: "SUCCESS"
+            ]
         } else {
             LOGGER.warn("Requested device ${requestedDevice.name} not found.")
         }
